@@ -23,6 +23,35 @@ fn get_oauth_flow_state() -> &'static Mutex<Option<OAuthFlowState>> {
     OAUTH_FLOW_STATE.get_or_init(|| Mutex::new(None))
 }
 
+/// Verify the `state` parameter returned by Google against the pending OAuth flow.
+///
+/// This is the CSRF guard of the authorization-code flow. Without it, anyone able
+/// to make the victim's browser issue a single GET (any web page can) could call
+/// the callback with *their own* authorization code and silently graft their Google
+/// account onto the victim's account pool — after which the victim's prompts may be
+/// routed through an account the attacker controls.
+///
+/// The embedded loopback listener already performed this check; this helper exposes
+/// the same verification to the proxy server's `/auth/callback` route, which is the
+/// path used in Web/Docker mode.
+///
+/// Returns `false` when no flow is pending, so a callback that was never initiated
+/// from this instance is rejected outright.
+pub fn verify_pending_state(received_state: Option<&str>) -> bool {
+    let received = match received_state {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+
+    match get_oauth_flow_state().lock() {
+        Ok(lock) => match lock.as_ref() {
+            Some(flow) => !flow.state.is_empty() && flow.state == received,
+            None => false,
+        },
+        Err(_) => false,
+    }
+}
+
 fn oauth_success_html() -> &'static str {
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
     <html>\

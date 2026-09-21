@@ -1563,7 +1563,16 @@
       "whitelist_priority_desc": "启用后，白名单 IP 将被允许访问，即使它们匹配黑名单规则。",
       "load_error": "加载配置失败",
       "save_success": "配置已保存",
-      "save_error": "保存配置失败"
+      "save_error": "保存配置失败",
+      "trusted_proxies_title": "可信反向代理",
+      "trusted_proxies_desc": "只有来自这些 IP 的请求，其 X-Forwarded-For / X-Real-IP 请求头才会被采信。每行一个。",
+      "trusted_proxies_hint": "若客户端不经反向代理（nginx、Caddy、cloudflared）直接访问，请留空。留空时仅使用真实的 TCP 对端地址。",
+      "trusted_proxies_warning": "只填写你自己控制的代理。列在此处的主机可以伪造任意来源 IP，从而绕过黑名单、白名单与令牌的 IP 限制。",
+      "cors_title": "浏览器来源 (CORS)",
+      "cors_desc": "允许从浏览器调用本代理的站点。每行一个来源，例如 https://chat.example.com",
+      "cors_hint": "除非使用基于浏览器的 AI 客户端，否则请留空。原生客户端（Codex、Claude Code、opencode、droid 等）不受 CORS 影响，无需在此填写。",
+      "cors_wildcard_warning": "填写 '*' 会允许你访问的任何网站向本代理发送请求并读取响应，从而消耗你的配额。请改用明确的来源。",
+      "cors_restart_note": "CORS 配置在重启代理服务后生效。"
     }
   },
   "user_token": {

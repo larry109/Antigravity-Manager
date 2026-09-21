@@ -76,6 +76,26 @@ pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<()
     let mut file = File::create(&temp_path)
         .map_err(|e| format!("Failed to create temporary file {:?}: {}", temp_path, e))?;
 
+    // [SECURITY] Restrict the file to its owner before any content is written.
+    //
+    // Every caller of this helper persists secrets: the account store holds Google
+    // OAuth refresh tokens in clear text, and the app config holds the proxy API key,
+    // the admin password and the proxy-pool credentials. With the default umask these
+    // land as 0644, i.e. readable by every other local user. Applying the mode to the
+    // temporary file (rather than to the target after the rename) means the content is
+    // never observable through a world-readable window.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "Failed to restrict permissions on temporary file {:?}: {}",
+                temp_path, e
+            ));
+        }
+    }
+
     if let Err(e) = file.write_all(content) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(format!(
@@ -107,6 +127,22 @@ pub fn write_atomic<P: AsRef<Path>>(target_path: P, content: &[u8]) -> Result<()
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_creates_owner_only_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+
+        write_atomic(&path, b"{\"refresh_token\":\"secret\"}").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "token store must not be readable by other users"
+        );
+    }
 
     #[test]
     fn test_write_atomic_basic() {

@@ -674,7 +674,31 @@ fn ensure_dir(path: &Path) -> Result<(), String> {
     if !path.exists() {
         fs::create_dir_all(path).map_err(|e| format!("failed_to_create_data_dir: {}", e))?;
     }
+    restrict_dir_to_owner(path);
     Ok(())
+}
+
+/// [SECURITY] Make a data directory owner-only (0700) on Unix.
+///
+/// This tree holds the Google OAuth refresh tokens, the proxy credentials and the
+/// SQLite databases. With the default umask it is created as 0755, so any other
+/// local account can walk in and read them. Best-effort: a failure here (e.g. a
+/// mounted volume that does not support chmod) must not stop the app from starting.
+fn restrict_dir_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+            crate::modules::logger::log_warn(&format!(
+                "Could not restrict permissions on {:?} to owner-only: {}",
+                path, e
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
 }
 
 /// Strip Windows `\\?\` / `\\?\UNC\` prefixes and quotes so paths stay portable
@@ -930,6 +954,7 @@ pub fn get_accounts_dir() -> Result<PathBuf, String> {
         fs::create_dir_all(&accounts_dir)
             .map_err(|e| format!("failed_to_create_accounts_dir: {}", e))?;
     }
+    restrict_dir_to_owner(&accounts_dir);
 
     Ok(accounts_dir)
 }

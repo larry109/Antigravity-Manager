@@ -100,9 +100,19 @@ async fn auth_middleware_internal(
         }
 
         // 内部端点 (/internal/*) 豁免鉴权 - 用于 warmup 等内部功能
+        // 仅限本机回环连接：这些端点由本进程自己调用 (见 modules::quota)，
+        // 从不需要从外部到达。之前的无条件豁免让任何人都能在暴露的实例上
+        // 触发全账号预热并消耗配额。
         if is_internal_endpoint {
-            tracing::debug!("Internal endpoint bypassed auth: {}", path);
-            return Ok(next.run(request).await);
+            if crate::proxy::middleware::ip_filter::is_loopback_peer(&request) {
+                tracing::debug!("Internal endpoint bypassed auth (loopback): {}", path);
+                return Ok(next.run(request).await);
+            }
+            tracing::warn!(
+                "Rejected non-loopback request to internal endpoint: {}",
+                path
+            );
+            return Err(StatusCode::NOT_FOUND);
         }
     } else {
         // Management endpoints always require admin auth; only health checks stay public.
@@ -142,19 +152,25 @@ async fn auth_middleware_internal(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    // 认证逻辑
+    // 认证逻辑（使用固定时间比较，避免通过响应时延逐字节爆破密钥）
     let authorized = if force_strict {
         // 管理接口：优先使用独立的 admin_password，如果没有则回退使用 api_key
         match &security.admin_password {
-            Some(pwd) if !pwd.is_empty() => api_key.map(|k| k == pwd).unwrap_or(false),
+            Some(pwd) if !pwd.is_empty() => {
+                api_key.map(|k| constant_time_eq(k, pwd)).unwrap_or(false)
+            }
             _ => {
                 // 回退使用 api_key
-                api_key.map(|k| k == security.api_key).unwrap_or(false)
+                api_key
+                    .map(|k| constant_time_eq(k, &security.api_key))
+                    .unwrap_or(false)
             }
         }
     } else {
         // AI 代理接口：仅允许使用 api_key
-        api_key.map(|k| k == security.api_key).unwrap_or(false)
+        api_key
+            .map(|k| constant_time_eq(k, &security.api_key))
+            .unwrap_or(false)
     };
 
     if authorized {
@@ -164,8 +180,13 @@ async fn auth_middleware_internal(
         let token = api_key.unwrap();
 
         // 提取 IP (复用 ip_filter 规范化逻辑，支持 IPv4/IPv6 及 ConnectInfo)
-        let client_ip = crate::proxy::middleware::ip_filter::extract_client_ip(&request)
-            .unwrap_or_else(|| "127.0.0.1".to_string()); // Default fallback
+        // X-Forwarded-For 仅在来自已配置的可信反代时才被采信，否则 Token 的
+        // IP 绑定上限可以被任意伪造的请求头绕过。
+        let client_ip = crate::proxy::middleware::ip_filter::extract_client_ip_with_trust(
+            &request,
+            &security.security_monitor.trusted_proxies,
+        )
+        .unwrap_or_else(|| "127.0.0.1".to_string()); // Default fallback
 
         // 验证 Token
         match crate::modules::user_token_db::validate_token(token, &client_ip) {
@@ -226,6 +247,24 @@ async fn auth_middleware_internal(
     }
 }
 
+/// 固定时间字符串比较。
+///
+/// `==` on secrets returns as soon as two bytes differ, which leaks the length of
+/// the matching prefix through response timing and lets an attacker recover the
+/// key one byte at a time. Comparing every byte removes that signal. The length of
+/// the supplied value is still observable, which is not useful on its own.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// 用户令牌身份信息 (传递给 Monitor 使用)
 #[derive(Clone, Debug)]
 pub struct UserTokenIdentity {
@@ -260,6 +299,17 @@ mod tests {
 
         // 此测试由于涉及 Next 中间件调用比较复杂,主要验证核心逻辑
         // 我们在 auth_middleware_internal 基础上做了逻辑校验即可
+    }
+
+    #[test]
+    fn constant_time_eq_matches_plain_equality() {
+        assert!(constant_time_eq("sk-secret", "sk-secret"));
+        assert!(!constant_time_eq("sk-secret", "sk-secreT"));
+        assert!(!constant_time_eq("sk-secret", "sk-secre"));
+        assert!(!constant_time_eq("", "x"));
+        assert!(constant_time_eq("", ""));
+        // A shared prefix must not be treated as a match.
+        assert!(!constant_time_eq("sk-aaaaaaaa", "sk-aaaaaaab"));
     }
 
     #[test]
