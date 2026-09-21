@@ -306,6 +306,65 @@ impl SystemIntegration for DesktopIntegration {
     }
 }
 
+/// Applications authorized to read the Antigravity Keychain item without a prompt.
+///
+/// Replaces the previous blanket `-A` (every local application). Only the Antigravity
+/// installations actually present on this machine are granted access, so account
+/// switching stays seamless while unrelated processes no longer get a free read.
+#[cfg(target_os = "macos")]
+fn macos_keychain_trusted_apps() -> Vec<String> {
+    let mut apps: Vec<String> = Vec::new();
+
+    let push_if_exists = |candidate: std::path::PathBuf, apps: &mut Vec<String>| {
+        if candidate.exists() {
+            if let Some(p) = candidate.to_str() {
+                let p = p.to_string();
+                if !apps.contains(&p) {
+                    apps.push(p);
+                }
+            }
+        }
+    };
+
+    // Standard installation locations, system-wide and per-user.
+    let mut roots: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("Applications"));
+    }
+
+    for root in &roots {
+        for name in ["Antigravity", "Antigravity IDE"] {
+            push_if_exists(root.join(format!("{}.app", name)), &mut apps);
+        }
+    }
+
+    // User-configured or currently running installation (may live outside /Applications).
+    for target in [None, Some("ide")] {
+        if let Some(path) = crate::modules::process::get_antigravity_executable_path(target) {
+            push_if_exists(bundle_root_of(&path), &mut apps);
+        }
+    }
+
+    apps
+}
+
+/// Walk a path up to its enclosing `.app` bundle, if it is inside one.
+///
+/// `get_antigravity_executable_path` may return either the bundle itself
+/// (`/Applications/Antigravity.app`) or the binary inside it
+/// (`.../Antigravity.app/Contents/MacOS/Electron`); `security -T` wants the bundle.
+#[cfg(target_os = "macos")]
+fn bundle_root_of(path: &std::path::Path) -> std::path::PathBuf {
+    let mut current = Some(path);
+    while let Some(p) = current {
+        if p.extension().and_then(|e| e.to_str()) == Some("app") {
+            return p.to_path_buf();
+        }
+        current = p.parent();
+    }
+    path.to_path_buf()
+}
+
 /// 辅助方法：向宿主操作系统的 Keychain/Credentials Manager 写入 Token
 fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), String> {
     // 1. 构建 Token 的 JSON Payload，并将过期时间戳格式化为符合 RFC3339 的带微秒格式
@@ -362,18 +421,45 @@ fn write_to_system_keyring(account: &crate::models::Account) -> Result<(), Strin
             ])
             .output();
 
-        // 写入新的 (-A 参数允许所有本地应用免密码、无感直接读取凭据)
+        // 写入新的凭据。
+        //
+        // [SECURITY] 此处曾使用 `-A`，即「允许任意本地应用免密码读取该凭据」。
+        // 这意味着机器上的任何进程（包括恶意软件）都能静默读取 Google 凭据。
+        // 改为 `-T <app>`：只把实际需要该凭据的 IDE 加入访问控制列表，
+        // 从而保留账号切换的无感体验，同时不再对全系统开放。
+        //
+        // 注意：创建该条目的进程（/usr/bin/security）会自动进入 ACL，
+        // 因此本应用后续的读取路径无需额外授权。这也意味着本修复并不彻底：
+        // 任何进程仍可通过再次调用 `security` 命令行读取该条目。彻底的修复
+        // 需要改用原生 Keychain API（security-framework crate）直接以本应用
+        // 身份创建条目，属于重构而非补丁。即便如此，`-T` 仍严格优于 `-A`：
+        // 直接使用 Keychain API 的应用不再能静默读取。
+        let trusted_apps = macos_keychain_trusted_apps();
+
+        let mut args: Vec<String> = vec![
+            "add-generic-password".to_string(),
+            "-s".to_string(),
+            "gemini".to_string(),
+            "-a".to_string(),
+            "antigravity".to_string(),
+            "-w".to_string(),
+            full_keyring_value.clone(),
+        ];
+
+        if trusted_apps.is_empty() {
+            crate::modules::logger::log_warn(
+                "No Antigravity installation found to authorize on the Keychain item; \
+                 macOS will prompt for approval the first time the IDE reads it.",
+            );
+        } else {
+            for app in &trusted_apps {
+                args.push("-T".to_string());
+                args.push(app.clone());
+            }
+        }
+
         let output = Command::new("security")
-            .args([
-                "add-generic-password",
-                "-s",
-                "gemini",
-                "-a",
-                "antigravity",
-                "-w",
-                &full_keyring_value,
-                "-A",
-            ])
+            .args(&args)
             .output()
             .map_err(|e| format!("Failed to execute security command: {}", e))?;
 

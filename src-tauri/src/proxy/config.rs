@@ -836,6 +836,31 @@ pub struct SecurityMonitorConfig {
     /// IP 白名单配置
     #[serde(default)]
     pub whitelist: IpWhitelistConfig,
+
+    /// Reverse proxies whose `X-Forwarded-For` / `X-Real-IP` headers may be trusted.
+    ///
+    /// Empty (the default) means the forwarded headers are ignored entirely and the
+    /// peer address of the TCP connection is always used. Without this allow-list any
+    /// client could spoof its own IP and walk straight through the blacklist, the
+    /// whitelist and the per-token IP binding.
+    ///
+    /// Put the address of your reverse proxy here (nginx, Caddy, cloudflared, ...)
+    /// when the proxy is not reached directly — e.g. `["127.0.0.1", "::1"]`.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// Browser origins allowed to call the proxy cross-site (CORS).
+    ///
+    /// Empty (the default) means no cross-origin browser client is allowed: the
+    /// response carries no `Access-Control-Allow-Origin` header at all. Native
+    /// clients (Codex, Claude Code, opencode, droid, ...) are unaffected — CORS is
+    /// a browser-only mechanism.
+    ///
+    /// Add the exact origin of a browser-based client to let it through, e.g.
+    /// `["https://lobechat.example"]`. The single entry `"*"` restores the previous
+    /// allow-any behaviour and is strongly discouraged.
+    #[serde(default)]
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Default for SecurityMonitorConfig {
@@ -843,6 +868,8 @@ impl Default for SecurityMonitorConfig {
         Self {
             blacklist: IpBlacklistConfig::default(),
             whitelist: IpWhitelistConfig::default(),
+            trusted_proxies: Vec::new(),
+            cors_allowed_origins: Vec::new(),
         }
     }
 }

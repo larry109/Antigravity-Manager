@@ -13,9 +13,12 @@ services:
       - "${PORT:-8045}:8045"
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-info}
-      - API_KEY=${API_KEY:-changeme}
+      # [SECURITY] No default credential on purpose — see docker-compose.yml.
+      # This override publishes the port (bridge mode) and defaults to binding all
+      # interfaces, so a placeholder password here would be directly reachable.
+      - API_KEY=${API_KEY:?set API_KEY to a strong secret, e.g. openssl rand -hex 32}
       - WEB_PASSWORD=${WEB_PASSWORD:-}
-      - ABV_API_KEY=${API_KEY:-changeme}
+      - ABV_API_KEY=${API_KEY:?set API_KEY to a strong secret, e.g. openssl rand -hex 32}
       - ABV_WEB_PASSWORD=${WEB_PASSWORD:-}
       - ABV_BIND_LOCAL_ONLY=${ABV_BIND_LOCAL_ONLY:-false}
       - ABV_DATA_DIR=${ABV_DATA_DIR:-/root/.antigravity_tools}
