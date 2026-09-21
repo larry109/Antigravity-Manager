@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { request as invoke } from '../../utils/request';
-import { Save, AlertTriangle, Shield, ShieldCheck } from 'lucide-react';
+import { Save, AlertTriangle, Shield, ShieldCheck, Network, Globe } from 'lucide-react';
 import { showToast } from '../common/ToastContainer';
 
 interface IpBlacklistConfig {
@@ -17,7 +17,13 @@ interface IpWhitelistConfig {
 interface SecurityMonitorConfig {
     blacklist: IpBlacklistConfig;
     whitelist: IpWhitelistConfig;
+    trusted_proxies: string[];
+    cors_allowed_origins: string[];
 }
+
+/** Turn a textarea (one entry per line) into the list the backend expects. */
+const linesToList = (raw: string): string[] =>
+    raw.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
 
 export const SecurityConfig: React.FC = () => {
     const { t } = useTranslation();
@@ -33,7 +39,13 @@ export const SecurityConfig: React.FC = () => {
         setLoading(true);
         try {
             const data = await invoke<SecurityMonitorConfig>('get_security_config');
-            setConfig(data);
+            // Configs written by an older build carry neither field; normalise so the
+            // controlled inputs below never receive undefined.
+            setConfig({
+                ...data,
+                trusted_proxies: data.trusted_proxies ?? [],
+                cors_allowed_origins: data.cors_allowed_origins ?? [],
+            });
         } catch (e) {
             console.error('Failed to load security config', e);
             showToast(t('security.config.load_error'), 'error');
@@ -167,6 +179,79 @@ export const SecurityConfig: React.FC = () => {
                         <label className="label ml-8 pt-0">
                             <span className="label-text-alt text-gray-400">{t('security.config.whitelist_priority_desc')}</span>
                         </label>
+                    </div>
+                </div>
+            </div>
+
+            {/* Trusted reverse proxies */}
+            <div className="card bg-base-100 border border-gray-200 dark:border-base-300 shadow-sm">
+                <div className="card-body">
+                    <h3 className="card-title flex items-center gap-2 text-blue-500">
+                        <Network size={24} />
+                        {t('security.config.trusted_proxies_title')}
+                    </h3>
+                    <p className="text-sm text-gray-500 mb-4">{t('security.config.trusted_proxies_desc')}</p>
+
+                    <div className="form-control w-full">
+                        <textarea
+                            className="textarea textarea-bordered w-full font-mono text-sm"
+                            rows={3}
+                            spellCheck={false}
+                            placeholder={"127.0.0.1\n::1"}
+                            value={config.trusted_proxies.join('\n')}
+                            onChange={(e) => setConfig({
+                                ...config,
+                                trusted_proxies: linesToList(e.target.value)
+                            })}
+                        />
+                        <label className="label">
+                            <span className="label-text-alt text-gray-400">{t('security.config.trusted_proxies_hint')}</span>
+                        </label>
+                    </div>
+
+                    <div className="text-xs text-gray-500 bg-yellow-50 dark:bg-yellow-900/20 p-2 rounded flex items-start gap-2">
+                        <AlertTriangle size={14} className="mt-0.5 text-yellow-600 dark:text-yellow-400 shrink-0" />
+                        {t('security.config.trusted_proxies_warning')}
+                    </div>
+                </div>
+            </div>
+
+            {/* CORS origins */}
+            <div className="card bg-base-100 border border-gray-200 dark:border-base-300 shadow-sm">
+                <div className="card-body">
+                    <h3 className="card-title flex items-center gap-2 text-purple-500">
+                        <Globe size={24} />
+                        {t('security.config.cors_title')}
+                    </h3>
+                    <p className="text-sm text-gray-500 mb-4">{t('security.config.cors_desc')}</p>
+
+                    <div className="form-control w-full">
+                        <textarea
+                            className="textarea textarea-bordered w-full font-mono text-sm"
+                            rows={3}
+                            spellCheck={false}
+                            placeholder={"https://chat.example.com"}
+                            value={config.cors_allowed_origins.join('\n')}
+                            onChange={(e) => setConfig({
+                                ...config,
+                                cors_allowed_origins: linesToList(e.target.value)
+                            })}
+                        />
+                        <label className="label">
+                            <span className="label-text-alt text-gray-400">{t('security.config.cors_hint')}</span>
+                        </label>
+                    </div>
+
+                    {config.cors_allowed_origins.includes('*') && (
+                        <div className="text-xs text-gray-500 bg-red-50 dark:bg-red-900/20 p-2 rounded flex items-start gap-2">
+                            <AlertTriangle size={14} className="mt-0.5 text-red-600 dark:text-red-400 shrink-0" />
+                            {t('security.config.cors_wildcard_warning')}
+                        </div>
+                    )}
+
+                    <div className="text-xs text-gray-500 bg-blue-50 dark:bg-blue-900/20 p-2 rounded flex items-start gap-2">
+                        <AlertTriangle size={14} className="mt-0.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                        {t('security.config.cors_restart_note')}
                     </div>
                 </div>
             </div>
