@@ -24,7 +24,6 @@ pub async fn ip_filter_middleware(
     let client_ip = extract_client_ip_with_trust(&request, &security_config.trusted_proxies);
 
     if let Some(ip) = &client_ip {
-
         // 1. 检查白名单 (如果启用白名单模式,只允许白名单 IP)
         if security_config.whitelist.enabled {
             match security_db::is_ip_in_whitelist(ip) {

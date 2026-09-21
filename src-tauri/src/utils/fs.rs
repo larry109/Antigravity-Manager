@@ -138,7 +138,10 @@ mod tests {
         write_atomic(&path, b"{\"refresh_token\":\"secret\"}").unwrap();
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "token store must not be readable by other users");
+        assert_eq!(
+            mode, 0o600,
+            "token store must not be readable by other users"
+        );
     }
 
     #[test]
