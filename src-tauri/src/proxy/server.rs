@@ -563,6 +563,13 @@ impl AxumServer {
         // 启动 TokenManager 后台维护（主动预刷新与限流自动清理）
         token_manager.start_auto_cleanup().await;
 
+        // Capture the CORS allow-list before `security_config` is moved into the Arc.
+        // The CORS layer is built once at router construction time, so changing the
+        // allow-list takes effect on the next proxy restart.
+        let cors_allowed_origins = security_config
+            .security_monitor
+            .cors_allowed_origins
+            .clone();
         let security_state = Arc::new(RwLock::new(security_config));
         let experimental_state = Arc::new(RwLock::new(experimental_config));
         let debug_logging_state = Arc::new(RwLock::new(debug_logging));
@@ -1114,9 +1121,17 @@ impl AxumServer {
             // OAuth (Web) - Admin 接口
             .route("/auth/url", get(admin_prepare_oauth_url_web))
             // 应用管理特定鉴权层 (强制校验)
+            // 注意：Axum layer 执行顺序是从下往上，因此 ip_filter 先于 admin_auth 执行。
+            // [SECURITY] 管理接口此前完全绕过 IP 黑白名单：它暴露 /accounts/export
+            // （明文返回全部 Google refresh token），是最敏感的攻击面，必须与
+            // AI 代理接口享受同等的 IP 过滤保护。
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 admin_auth_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                ip_filter_middleware,
             ));
 
         // 3. 整合并应用全局层
@@ -1137,7 +1152,7 @@ impl AxumServer {
                 state.clone(),
                 service_status_middleware,
             ))
-            .layer(cors_layer())
+            .layer(cors_layer(&cors_allowed_origins))
             .layer(DefaultBodyLimit::max(max_body_size)) // 放宽 body 大小限制
             .with_state(state.clone());
 
@@ -3824,6 +3839,10 @@ async fn admin_cloudflared_start(
     State(state): State<AppState>,
     Json(payload): Json<CloudflaredStartRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    // [SECURITY] Never publish an unauthenticated proxy to the Internet.
+    crate::commands::cloudflared::ensure_tunnel_auth_configured()
+        .map_err(|e| (StatusCode::FORBIDDEN, Json(ErrorResponse { error: e })))?;
+
     state
         .cloudflared_state
         .ensure_manager()
@@ -4302,11 +4321,28 @@ async fn admin_get_cli_config_content(
 #[derive(Deserialize)]
 struct OAuthParams {
     code: Option<String>,
+    /// CSRF token echoed back by Google; validated against the pending flow.
     state: Option<String>,
     #[allow(dead_code)]
     scope: Option<String>,
     error: Option<String>,
     error_description: Option<String>,
+}
+
+/// Minimal HTML escaping for values interpolated into the callback pages.
+fn html_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 async fn handle_oauth_callback(
@@ -4320,7 +4356,7 @@ async fn handle_oauth_callback(
         crate::modules::oauth_server::cancel_oauth_flow();
         return Ok(Html(format!(
             r#"<html><body style="font-family:sans-serif;text-align:center;padding:50px;"><h1 style="color:red;">❌ Authorization Failed</h1><p>Provider returned error: {}</p></body></html>"#,
-            desc
+            html_escape(&desc)
         )));
     }
 
@@ -4356,7 +4392,18 @@ async fn handle_oauth_callback(
         }
         (flow_redirect_uri, Some(flow_client_key))
     } else {
-        (get_oauth_redirect_uri(port, host, proto, None), None)
+        // [SECURITY] No login was started from this instance: there is no `state` to
+        // check the callback against. Accepting the code anyway is a login-CSRF sink —
+        // any web page could fire `GET /auth/callback?code=<attacker code>` and graft
+        // the attacker's Google account onto this pool. Refuse instead.
+        let _ = (port, host, proto);
+        tracing::warn!(
+            "OAuth callback rejected: no pending OAuth flow (CSRF protection)"
+        );
+        return Ok(Html(
+            r#"<html><body style="font-family:sans-serif;text-align:center;padding:50px;"><h1 style="color:red;">❌ Authorization Failed</h1><p>Invalid or expired authorization state. Please start the login from the application again.</p></body></html>"#
+                .to_string(),
+        ));
     };
 
     match crate::modules::oauth::exchange_code_with_client(
@@ -4371,7 +4418,7 @@ async fn handle_oauth_callback(
                 error!("Failed to save account in OAuth callback: {}", e);
                 return Ok(Html(format!(
                     r#"<html><body><h1>Authorization Failed</h1><p>Failed to save account: {}</p></body></html>"#,
-                    e
+                    html_escape(&e.to_string())
                 )));
             }
 
@@ -4446,7 +4493,7 @@ async fn handle_oauth_callback(
             crate::modules::oauth_server::cancel_oauth_flow();
             Ok(Html(format!(
                 r#"<html><body><h1>Authorization Failed</h1><p>Error: {}</p></body></html>"#,
-                e
+                html_escape(&e)
             )))
         }
     }
