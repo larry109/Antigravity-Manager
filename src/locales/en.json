@@ -1597,7 +1597,16 @@
       "whitelist_priority_desc": "If enabled, whitelisted IPs will be allowed even if they match blacklist rules.",
       "load_error": "Failed to load configuration",
       "save_success": "Configuration saved",
-      "save_error": "Failed to save configuration"
+      "save_error": "Failed to save configuration",
+      "trusted_proxies_title": "Trusted Reverse Proxies",
+      "trusted_proxies_desc": "IP addresses whose X-Forwarded-For / X-Real-IP headers may be believed. One per line.",
+      "trusted_proxies_hint": "Leave empty unless clients reach this service through a reverse proxy (nginx, Caddy, cloudflared). When empty, only the real TCP peer address is used.",
+      "trusted_proxies_warning": "Only list proxies you control. Any host added here can claim to be any IP, bypassing the blacklist, the whitelist and per-token IP limits.",
+      "cors_title": "Browser Origins (CORS)",
+      "cors_desc": "Websites allowed to call this proxy from a browser. One origin per line, e.g. https://chat.example.com",
+      "cors_hint": "Leave empty unless you use a browser-based AI client. Native clients (Codex, Claude Code, opencode, droid...) are not affected by CORS and never need an entry here.",
+      "cors_wildcard_warning": "'*' allows ANY website you visit to send requests to this proxy and read the answers, consuming your quota. Use an explicit origin instead.",
+      "cors_restart_note": "CORS changes take effect after the proxy service is restarted."
     }
   },
   "user_token": {
