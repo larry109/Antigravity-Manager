@@ -229,14 +229,26 @@ pub fn determine_retry_strategy_adaptive(
 
             // 3. 单账号模式 (pool_size <= 1)：无法切号，等待是唯一选择
             if pool_size <= 1 {
+                // Fork: a GraceRetry is not counted by `next_rotation_attempt`, so it must
+                // stay once-per-account like in the multi-account branch below. Returning
+                // it unconditionally here made a persistent 429 on a single account retry
+                // forever: the request never failed and the client waited indefinitely.
+                let wait = |ms: u64| {
+                    if allow_grace_retry {
+                        RetryStrategy::GraceRetry(Duration::from_millis(ms))
+                    } else {
+                        RetryStrategy::FixedDelay(Duration::from_millis(ms))
+                    }
+                };
                 if let Some(delay) = parsed_delay {
                     let actual_ms = delay.actual_wait_ms();
                     if actual_ms <= 30_000 {
                         tracing::info!(
-                            "[Retry] Single account 429: quotaResetDelay detected ({}ms), applying GraceRetry",
-                            actual_ms
+                            "[Retry] Single account 429: quotaResetDelay detected ({}ms), grace retry allowed: {}",
+                            actual_ms,
+                            allow_grace_retry
                         );
-                        return RetryStrategy::GraceRetry(Duration::from_millis(actual_ms));
+                        return wait(actual_ms);
                     } else {
                         return RetryStrategy::FixedDelay(Duration::from_millis(30_000));
                     }
@@ -244,10 +256,11 @@ pub fn determine_retry_strategy_adaptive(
                     // 没有给出明确延迟时的保底退避 (单账号等待 3s~5s，杜绝 50ms 闪电耗尽重试)
                     let backoff_ms = (3000 * (attempt + 1) as u64).min(10_000);
                     tracing::info!(
-                        "[Retry] Single account 429 without explicit delay: backing off {}ms",
-                        backoff_ms
+                        "[Retry] Single account 429 without explicit delay: backing off {}ms, grace retry allowed: {}",
+                        backoff_ms,
+                        allow_grace_retry
                     );
-                    return RetryStrategy::GraceRetry(Duration::from_millis(backoff_ms));
+                    return wait(backoff_ms);
                 }
             }
 
@@ -382,6 +395,38 @@ mod tests {
         let mut all_503 = FailureStatusTracker::default();
         all_503.record(StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(all_503.final_status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A single account that keeps answering 429 without any retry delay (the body
+    /// Google actually sends when the account is throttled) must end the request:
+    /// one grace retry on the same account, then the regular, counted budget.
+    #[test]
+    fn single_account_429_without_delay_is_bounded() {
+        let body = r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}"#;
+        let max_attempts = calculate_max_retry_attempts(1);
+        let mut state = RequestRetryState::default();
+        let mut used_attempts = 0;
+        let mut retry_same_account = false;
+        let mut sends = Vec::new();
+
+        while let Some(attempt) =
+            next_rotation_attempt(&mut used_attempts, max_attempts, retry_same_account)
+        {
+            assert!(
+                sends.len() < 20,
+                "retry loop did not terminate: {:?}",
+                sends
+            );
+            retry_same_account = false;
+            sends.push(attempt);
+            let strategy =
+                state.determine_strategy_adaptive("account-0", 429, body, None, false, attempt, 1);
+            if !should_rotate_account(429, Some(&strategy)) {
+                retry_same_account = true;
+            }
+        }
+
+        assert_eq!(sends, vec![0, 0, 1, 2]);
     }
 }
 
