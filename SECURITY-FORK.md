@@ -125,6 +125,28 @@ is provided.
 
 Upstream error strings were interpolated raw into HTML. Now escaped via `html_escape`.
 
+### 12. A single account can no longer retry a 429 forever
+`src-tauri/src/proxy/handlers/common.rs`
+
+Not a security issue but an availability one, found in production with one Google
+account behind a public site. A 429 on a single-account pool always returned
+`GraceRetry`, and `next_rotation_attempt` does not count grace retries against
+`max_attempts`. As long as Google kept answering 429 — with or without a retry delay —
+the request looped every 3 s and never failed, so the client waited indefinitely and
+could not fall back to anything else.
+
+The multi-account branch already limited grace retries to one per account through
+`RequestRetryState::grace_retried_accounts`; the single-account branch now honours the
+same `allow_grace_retry` flag and falls back to a counted `FixedDelay` afterwards. A
+persistent 429 now ends after `calculate_max_retry_attempts(1)` = 3 counted attempts
+(4 upstream calls). Covered by `single_account_429_without_delay_is_bounded`; the
+existing `task_short_429_preserves_rotation_budget_and_structured_status` also relied
+on this bound and hung before the fix (CI compiles tests but never runs them).
+
+Note: the `allow_grace` value computed from `scheduling.mode` in `handlers/gemini.rs`
+and `handlers/openai.rs` is never used, so switching to `PerformanceFirst` did **not**
+work around this bug. Left as is.
+
 ## Known issues deliberately NOT changed
 
 These were found during the audit and left alone on purpose — fixing them would cost
