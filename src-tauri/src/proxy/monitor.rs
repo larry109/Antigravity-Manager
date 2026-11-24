@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tauri::Emitter;
 use tokio::sync::{RwLock, Semaphore};
 
 // Admission happens before spawn_blocking, so queued tasks cannot retain unlimited bodies.
 static LOG_WRITERS: Semaphore = Semaphore::const_new(4);
+
+/// 因写盘闸门繁忙而丢弃的请求日志计数（仅用于限流上报，不影响业务）
+static LOG_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyRequestLog {
@@ -18,6 +21,8 @@ pub struct ProxyRequestLog {
     pub duration: u64,                // ms
     pub model: Option<String>,        // 客户端请求的模型名
     pub mapped_model: Option<String>, // 实际路由后使用的模型名
+    #[serde(default)]
+    pub upstream_model: Option<String>,
     pub account_email: Option<String>,
     pub client_ip: Option<String>, // 客户端 IP 地址
     pub error: Option<String>,
@@ -33,10 +38,35 @@ pub struct ProxyRequestLog {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
     pub cached_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
     pub protocol: Option<String>, // 协议类型: "openai", "anthropic", "gemini"
     pub username: Option<String>, // User token username
     #[serde(default)]
     pub session_id: Option<String>, // 会话标识 (如 sess-xxx)
+}
+
+impl ProxyRequestLog {
+    /// 获取从响应头或显式字段提取的首字延迟 (毫秒)
+    pub fn ttft_ms(&self) -> Option<f64> {
+        self.response_headers
+            .as_deref()
+            .and_then(|h| serde_json::from_str::<serde_json::Value>(h).ok())
+            .and_then(|val| {
+                val.get("x-timing-ttft-ms")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .filter(|&n| n > 0.0)
+            })
+    }
+
+    /// 获取实际消耗配额/生效的模型名称（优先实际路由/上游模型，退化至原始请求模型）
+    pub fn effective_model(&self) -> &str {
+        self.mapped_model
+            .as_deref()
+            .or(self.upstream_model.as_deref())
+            .or(self.model.as_deref())
+            .unwrap_or("unknown")
+    }
 }
 
 #[cfg(test)]
@@ -54,16 +84,35 @@ pub(crate) mod prompt_log_tests {
     }
 
     // Tests using ABV_DATA_DIR run serially and restore the previous process setting.
+    // Unified with crate::modules::account::SHARED_TEST_ENV_LOCK to prevent split-brain mutex race.
+    thread_local! {
+        static REENTRANCY_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     pub(crate) struct TestDataDir {
+        _guard: Option<std::sync::MutexGuard<'static, ()>>,
         _dir: tempfile::TempDir,
         previous: Option<std::ffi::OsString>,
     }
     impl TestDataDir {
         pub(crate) fn new() -> Self {
+            let depth = REENTRANCY_DEPTH.get();
+            let guard = if depth == 0 {
+                Some(
+                    crate::modules::account::SHARED_TEST_ENV_LOCK
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()),
+                )
+            } else {
+                None
+            };
+            REENTRANCY_DEPTH.set(depth + 1);
+
             let dir = tempfile::tempdir().unwrap();
             let previous = std::env::var_os("ABV_DATA_DIR");
             std::env::set_var("ABV_DATA_DIR", dir.path());
             Self {
+                _guard: guard,
                 _dir: dir,
                 previous,
             }
@@ -75,6 +124,10 @@ pub(crate) mod prompt_log_tests {
                 std::env::set_var("ABV_DATA_DIR", previous);
             } else {
                 std::env::remove_var("ABV_DATA_DIR");
+            }
+            let depth = REENTRANCY_DEPTH.get();
+            if depth > 0 {
+                REENTRANCY_DEPTH.set(depth - 1);
             }
         }
     }
@@ -88,6 +141,7 @@ pub(crate) mod prompt_log_tests {
             stats: RwLock::new(ProxyStats::default()),
             max_logs: 2,
             enabled: Arc::new(AtomicBool::new(true)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
             app_handle: None,
         };
         let log = sample_log("detail", 4096);
@@ -107,6 +161,54 @@ pub(crate) mod prompt_log_tests {
         monitor.log_request(sample_log("disabled", 4096)).await;
         assert!(crate::modules::proxy_db::get_log_detail("disabled").is_err());
     }
+
+    #[test]
+    fn test_proxy_request_log_upstream_model_serialization() {
+        let json_data = serde_json::json!({
+            "id": "test-123",
+            "timestamp": 1234567890,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "status": 200,
+            "duration": 50,
+            "model": "gpt-4o",
+            "mapped_model": "gemini-2.5-pro",
+            "upstream_model": "gemini-2.5-pro-preview-05-06"
+        });
+
+        let log: ProxyRequestLog = serde_json::from_value(json_data).unwrap();
+        assert_eq!(
+            log.upstream_model.as_deref(),
+            Some("gemini-2.5-pro-preview-05-06")
+        );
+
+        // Summary retains upstream_model
+        let summary = log.summary();
+        assert_eq!(
+            summary.upstream_model.as_deref(),
+            Some("gemini-2.5-pro-preview-05-06")
+        );
+
+        // Round-trip serialization
+        let serialized = serde_json::to_string(&log).unwrap();
+        let deserialized: ProxyRequestLog = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.upstream_model.as_deref(),
+            Some("gemini-2.5-pro-preview-05-06")
+        );
+
+        // Default when omitted
+        let json_no_upstream = serde_json::json!({
+            "id": "test-456",
+            "timestamp": 1234567890,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "status": 200,
+            "duration": 50
+        });
+        let log_default: ProxyRequestLog = serde_json::from_value(json_no_upstream).unwrap();
+        assert_eq!(log_default.upstream_model, None);
+    }
 }
 
 impl ProxyRequestLog {
@@ -120,6 +222,7 @@ impl ProxyRequestLog {
             duration: self.duration,
             model: self.model.clone(),
             mapped_model: self.mapped_model.clone(),
+            upstream_model: self.upstream_model.clone(),
             account_email: self.account_email.clone(),
             client_ip: self.client_ip.clone(),
             error: self
@@ -131,10 +234,11 @@ impl ProxyRequestLog {
             response_body: None,
             request_headers: None,
             upstream_request_headers: None,
-            response_headers: None,
+            response_headers: self.response_headers.clone(),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cached_tokens: self.cached_tokens,
+            reasoning_tokens: self.reasoning_tokens,
             protocol: self.protocol.clone(),
             username: self.username.clone(),
             session_id: self.session_id.clone(),
@@ -146,10 +250,11 @@ impl ProxyRequestLog {
 pub(crate) struct UpstreamCapture {
     body: Option<String>,
     headers: Option<String>,
+    attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
 }
 
 #[derive(Clone, Default)]
-pub struct UpstreamRequestBodyHolder(pub std::sync::Arc<std::sync::Mutex<UpstreamCapture>>);
+pub struct UpstreamRequestBodyHolder(pub(crate) std::sync::Arc<std::sync::Mutex<UpstreamCapture>>);
 
 tokio::task_local! {
     pub static CURRENT_UPSTREAM_CAPTURE: UpstreamRequestBodyHolder;
@@ -187,6 +292,16 @@ impl UpstreamRequestBodyHolder {
 
     pub fn take_headers(&self) -> Option<String> {
         self.0.lock().ok().and_then(|mut g| g.headers.take())
+    }
+
+    pub fn set_attempts(&self, attempts: Vec<crate::proxy::upstream::client::FallbackAttemptLog>) {
+        if let Ok(mut lock) = self.0.lock() {
+            lock.attempts = Some(attempts);
+        }
+    }
+
+    pub fn take_attempts(&self) -> Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>> {
+        self.0.lock().ok().and_then(|mut g| g.attempts.take())
     }
 }
 
@@ -241,7 +356,40 @@ pub struct ProxyMonitor {
     pub stats: RwLock<ProxyStats>,
     pub max_logs: usize,
     pub enabled: Arc<AtomicBool>,
+    pub capture_health_logs: Arc<AtomicBool>,
     app_handle: Option<tauri::AppHandle>,
+}
+
+/// 全局监控器弱引用：后台模块（配额刷新、封禁探针等）不在 Axum 请求上下文中，
+/// 无法拿到 AppState，需要通过该注册表把探针异常写入同一份流量日志。
+static GLOBAL_MONITOR: OnceLock<Weak<ProxyMonitor>> = OnceLock::new();
+
+/// 注册全局监控器（进程内仅首次生效；反代停止后监控器仍由 ProxyServiceState 持有）。
+pub fn register_global_monitor(monitor: &Arc<ProxyMonitor>) {
+    let _ = GLOBAL_MONITOR.set(Arc::downgrade(monitor));
+}
+
+/// 获取全局监控器；未初始化或已被释放时返回 None。
+pub fn global_monitor() -> Option<Arc<ProxyMonitor>> {
+    GLOBAL_MONITOR.get().and_then(|weak| weak.upgrade())
+}
+
+/// 健康 / 探针类请求是否允许写入流量日志。
+///
+/// 默认只记录异常；打开面板「捕获健康请求」胶囊或设置
+/// `ABV_LOG_HEALTH_CHECKS=true` 后，成功的健康探针也完整落库。
+pub fn capture_health_logs_enabled(monitor: &ProxyMonitor) -> bool {
+    monitor.is_capture_health_logs() || health_log_capture_enabled_by_env()
+}
+
+/// 仅按环境变量判断是否捕获健康日志（供 Axum 中间件等无 monitor 引用的场景复用）。
+pub fn health_log_capture_enabled_by_env() -> bool {
+    std::env::var("ABV_LOG_HEALTH_CHECKS")
+        .map(|val| {
+            let v = val.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
 }
 
 impl ProxyMonitor {
@@ -284,6 +432,10 @@ impl ProxyMonitor {
                     tracing::error!("Failed to cleanup thinking records: {}", e);
                 }
             }
+            crate::modules::logger::sync_internal_error_log_budget_from_config();
+            if let Err(e) = crate::modules::logger::apply_internal_error_log_retention() {
+                tracing::error!("Failed to apply internal error log retention: {}", e);
+            }
         });
 
         tokio::spawn(async {
@@ -299,11 +451,14 @@ impl ProxyMonitor {
                     let retention_res = crate::modules::proxy_db::apply_retention(&retention);
                     let thinking_res =
                         crate::modules::proxy_db::cleanup_old_thinking_records(thinking_days);
-                    (retention_res, thinking_res)
+                    crate::modules::logger::sync_internal_error_log_budget_from_config();
+                    let error_log_res =
+                        crate::modules::logger::apply_internal_error_log_retention();
+                    (retention_res, thinking_res, error_log_res)
                 })
                 .await;
                 match result {
-                    Ok((retention_res, thinking_res)) => {
+                    Ok((retention_res, thinking_res, error_log_res)) => {
                         match retention_res {
                             Ok((cleared, deleted)) => {
                                 if cleared > 0 || deleted > 0 {
@@ -328,6 +483,9 @@ impl ProxyMonitor {
                         } else if let Err(e) = thinking_res {
                             tracing::error!("Failed to cleanup thinking records: {}", e);
                         }
+                        if let Err(e) = error_log_res {
+                            tracing::error!("Failed to apply internal error log retention: {}", e);
+                        }
                     }
                     Err(error) => tracing::error!("Proxy log retention task failed: {}", error),
                 }
@@ -339,7 +497,20 @@ impl ProxyMonitor {
             stats: RwLock::new(ProxyStats::default()),
             max_logs,
             enabled: Arc::new(AtomicBool::new(false)), // Default to disabled
+            capture_health_logs: Arc::new(AtomicBool::new(false)), // Default to false
             app_handle,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(max_logs: usize) -> Self {
+        Self {
+            logs: RwLock::new(VecDeque::with_capacity(max_logs)),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs,
+            enabled: Arc::new(AtomicBool::new(false)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+            app_handle: None,
         }
     }
 
@@ -351,16 +522,34 @@ impl ProxyMonitor {
         self.enabled.load(Ordering::Relaxed)
     }
 
+    pub fn set_capture_health_logs(&self, enabled: bool) {
+        self.capture_health_logs.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn is_capture_health_logs(&self) -> bool {
+        self.capture_health_logs.load(Ordering::Relaxed)
+    }
+
     pub async fn log_request(&self, log: ProxyRequestLog) {
         if let (Some(account), Some(input), Some(output)) =
             (&log.account_email, log.input_tokens, log.output_tokens)
         {
-            let model = log.model.clone().unwrap_or_else(|| "unknown".to_string());
+            let model = log.effective_model().to_string();
+            let requested_model = log.model.clone();
             let account = account.clone();
             let cached = log.cached_tokens.unwrap_or(0);
+            let reasoning = log.reasoning_tokens.unwrap_or(0);
+            let ttft_ms = log.ttft_ms();
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = crate::modules::token_stats::record_usage(
-                    &account, &model, input, output, cached,
+                    &account,
+                    &model,
+                    requested_model.as_deref(),
+                    input,
+                    output,
+                    cached,
+                    reasoning,
+                    ttft_ms,
                 ) {
                     tracing::debug!("Failed to record token stats: {}", e);
                 }
@@ -371,8 +560,9 @@ impl ProxyMonitor {
             return;
         }
         tracing::info!("[Monitor] Logging request: {} {}", log.method, log.url);
-        // Update stats
-        {
+        // 封禁探针是后台健康探测，不属于业务请求：保留流量日志供排障，但不计入成功率统计。
+        let is_health_probe = log.protocol.as_deref() == Some("ban_probe");
+        if !is_health_probe {
             let mut stats = self.stats.write().await;
             stats.total_requests += 1;
             if log.status >= 200 && log.status < 400 {
@@ -397,7 +587,16 @@ impl ProxyMonitor {
         }
 
         let Ok(permit) = LOG_WRITERS.try_acquire() else {
-            tracing::debug!("Skipping proxy log persistence: writers busy");
+            // 日志写盘繁忙时会被丢弃：这直接解释了“后台查不到这次请求”。
+            // 用计数限流上报，避免日志风暴，但保证这种“静默丢日志”可见。
+            let dropped = LOG_DROPS.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped % 100 == 1 {
+                // ERROR 级：丢弃请求日志 = 事后无法回溯，必须进 error.log
+                tracing::error!(
+                    "[Monitor] 日志落库繁忙，已丢弃 {} 条请求日志（不会出现在 proxy_logs.db）",
+                    dropped
+                );
+            }
             return;
         };
         // Save to DB (respect server-side simple/full storage mode)

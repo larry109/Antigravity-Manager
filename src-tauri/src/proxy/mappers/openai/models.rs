@@ -14,7 +14,15 @@ pub struct OpenAIRequest {
     pub stream: bool,
     #[serde(default)]
     pub n: Option<u32>, // [NEW] 支持多候选结果数量
-    #[serde(rename = "max_tokens")]
+    #[serde(
+        default,
+        rename = "max_tokens",
+        alias = "max_completion_tokens",
+        alias = "maxCompletionTokens",
+        alias = "maxTokens",
+        alias = "max_output_tokens",
+        alias = "maxOutputTokens"
+    )]
     pub max_tokens: Option<u32>,
     pub temperature: Option<f64>,
     #[serde(rename = "top_p")]
@@ -66,6 +74,9 @@ pub struct OpenAIRequest {
     // [NEW] OpenAI stream_options support (include_usage gate)
     #[serde(default, rename = "stream_options")]
     pub stream_options: Option<StreamOptions>,
+    // Responses API Structured Outputs / text config (e.g. text.format)
+    #[serde(default)]
+    pub text: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -79,7 +90,13 @@ pub struct StreamOptions {
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub thinking_type: Option<String>, // "enabled", "disabled", or "adaptive"
-    #[serde(rename = "budget_tokens", alias = "budgetTokens")]
+    #[serde(
+        default,
+        rename = "budget_tokens",
+        alias = "budgetTokens",
+        alias = "max_tokens",
+        alias = "maxTokens"
+    )]
     pub budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // "low", "high", or "max"
@@ -88,9 +105,17 @@ pub struct ThinkingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReasoningConfig {
     pub effort: Option<String>,
+    #[serde(
+        default,
+        rename = "max_tokens",
+        alias = "maxTokens",
+        alias = "budget_tokens",
+        alias = "budgetTokens"
+    )]
+    pub max_tokens: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResponseFormatJSONSchema {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -102,11 +127,31 @@ pub struct ResponseFormatJSONSchema {
     pub strict: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseFormat {
-    pub r#type: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub json_schema: Option<ResponseFormatJSONSchema>,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ResponseFormat {
+    TypeObject {
+        r#type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        json_schema: Option<ResponseFormatJSONSchema>,
+    },
+    TypeString(String),
+}
+
+impl ResponseFormat {
+    pub fn r#type(&self) -> &str {
+        match self {
+            ResponseFormat::TypeObject { r#type, .. } => r#type.as_str(),
+            ResponseFormat::TypeString(s) => s.as_str(),
+        }
+    }
+
+    pub fn json_schema(&self) -> Option<&ResponseFormatJSONSchema> {
+        match self {
+            ResponseFormat::TypeObject { json_schema, .. } => json_schema.as_ref(),
+            ResponseFormat::TypeString(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

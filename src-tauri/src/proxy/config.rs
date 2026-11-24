@@ -30,12 +30,19 @@ pub static TEST_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static GLOBAL_THINKING_BUDGET_CONFIG: OnceLock<RwLock<ThinkingBudgetConfig>> = OnceLock::new();
 
 /// 获取当前 Thinking Budget 配置
+///
+/// [2026-10-29] 官方已把 Gemini 3.8/4 与 Claude 5.5 全量迁移到 `thinkingLevel`，
+/// 网关不再提供「客户端自适应（Client Direct Control）」模式，也不再用自造的档位预算表。
+/// 这里强制归一到 `Gateway`：旧配置文件里的 `client` 会在读取时被忽略，
+/// 保证四个协议适配层全部走「官方结构体为准」的统一通道。
 pub fn get_thinking_budget_config() -> ThinkingBudgetConfig {
-    GLOBAL_THINKING_BUDGET_CONFIG
+    let mut cfg = GLOBAL_THINKING_BUDGET_CONFIG
         .get()
         .and_then(|lock| lock.read().ok())
         .map(|cfg| cfg.clone())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    cfg.control_source = ThinkingControlSource::Gateway;
+    cfg
 }
 
 /// 更新全局 Thinking Budget 配置
@@ -147,18 +154,203 @@ pub fn update_image_thinking_mode(mode: Option<String>) {
 }
 
 // ============================================================================
-// 全局压缩等级配置存储
+// 全局多模态交互与保鲜滑窗配置存储
 // ============================================================================
-static GLOBAL_COMPRESSION_LEVEL: OnceLock<RwLock<String>> = OnceLock::new();
-static GLOBAL_USAGE_SCALING: OnceLock<RwLock<bool>> = OnceLock::new();
-static GLOBAL_THRESHOLD_L1: OnceLock<RwLock<f32>> = OnceLock::new();
-static GLOBAL_THRESHOLD_L2: OnceLock<RwLock<f32>> = OnceLock::new();
-static GLOBAL_THRESHOLD_L3: OnceLock<RwLock<f32>> = OnceLock::new();
+static GLOBAL_MULTIMODAL_CONFIG: OnceLock<RwLock<MultimodalConfig>> = OnceLock::new();
+
+pub fn get_multimodal_config() -> MultimodalConfig {
+    GLOBAL_MULTIMODAL_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|cfg| cfg.clone())
+        .unwrap_or_default()
+}
+
+pub fn update_multimodal_config(config: MultimodalConfig) {
+    if let Some(lock) = GLOBAL_MULTIMODAL_CONFIG.get() {
+        if let Ok(mut cfg) = lock.write() {
+            if *cfg != config {
+                *cfg = config.clone();
+                tracing::info!(
+                    "[Multimodal-Config] Global config updated: sliding_window={}, strategy={}, max_fresh_images={}, strip_remote_urls={}, max_total_mb={}",
+                    config.enable_sliding_window,
+                    config.strategy,
+                    config.max_fresh_images,
+                    config.strip_remote_urls,
+                    config.max_total_image_mb,
+                );
+            }
+        }
+    } else {
+        let _ = GLOBAL_MULTIMODAL_CONFIG.set(RwLock::new(config.clone()));
+        tracing::info!(
+            "[Multimodal-Config] Global config initialized: sliding_window={}, strategy={}, max_fresh_images={}, strip_remote_urls={}, max_total_mb={}",
+            config.enable_sliding_window,
+            config.strategy,
+            config.max_fresh_images,
+            config.strip_remote_urls,
+            config.max_total_image_mb,
+        );
+    }
+}
+
+// ============================================================================
+// 全局流式梯度超时配置存储
+// ============================================================================
+static GLOBAL_STREAM_TIMEOUT_CONFIG: OnceLock<RwLock<StreamTimeoutConfig>> = OnceLock::new();
+
+/// 获取当前流式梯度超时配置（支持环境变量覆盖，保证 Headless/CLI 一致性）
+pub fn get_stream_timeout_config() -> StreamTimeoutConfig {
+    let base = GLOBAL_STREAM_TIMEOUT_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|cfg| cfg.clone())
+        .unwrap_or_default();
+
+    // 允许通过环境变量覆盖，符合 AGENTS.md Headless & CLI Parity 纪律
+    let initial_ttft_secs = std::env::var("ANTIGRAVITY_TIMEOUT_TTFT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(base.initial_ttft_secs);
+
+    let transition_secs = std::env::var("ANTIGRAVITY_TIMEOUT_TRANSITION_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(base.transition_secs);
+
+    let streaming_sliding_secs = std::env::var("ANTIGRAVITY_TIMEOUT_STREAMING_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(base.streaming_sliding_secs);
+
+    StreamTimeoutConfig {
+        initial_ttft_secs,
+        transition_secs,
+        streaming_sliding_secs,
+    }
+}
+
+/// 更新全局流式梯度超时配置
+pub fn update_stream_timeout_config(config: StreamTimeoutConfig) {
+    if let Some(lock) = GLOBAL_STREAM_TIMEOUT_CONFIG.get() {
+        if let Ok(mut cfg) = lock.write() {
+            if *cfg != config {
+                *cfg = config.clone();
+                tracing::info!(
+                    "[Stream-Timeouts] Global config updated: ttft={}s, transition={}s, sliding={}s",
+                    config.initial_ttft_secs,
+                    config.transition_secs,
+                    config.streaming_sliding_secs
+                );
+            }
+        }
+    } else {
+        let _ = GLOBAL_STREAM_TIMEOUT_CONFIG.set(RwLock::new(config.clone()));
+        tracing::info!(
+            "[Stream-Timeouts] Global config initialized: ttft={}s, transition={}s, sliding={}s",
+            config.initial_ttft_secs,
+            config.transition_secs,
+            config.streaming_sliding_secs
+        );
+    }
+}
+
+// ============================================================================
+// 全局上游发送阶段分级超时配置存储 (Fixes #3763)
+// ============================================================================
+static GLOBAL_UPLOAD_TIMEOUT_CONFIG: OnceLock<RwLock<UploadTimeoutConfig>> = OnceLock::new();
+
+/// 获取当前上传阶段超时配置（支持环境变量覆盖，保证 Headless/CLI 一致性）
+pub fn get_upload_timeout_config() -> UploadTimeoutConfig {
+    let base = GLOBAL_UPLOAD_TIMEOUT_CONFIG
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|cfg| cfg.clone())
+        .unwrap_or_default();
+
+    // 允许通过环境变量覆盖，符合 AGENTS.md Headless & CLI Parity 纪律
+    let connect_secs = env_u64("ANTIGRAVITY_TIMEOUT_CONNECT_SECS", base.connect_secs);
+    let min_upload_mbps = std::env::var("ANTIGRAVITY_TIMEOUT_UPLOAD_MIN_MBPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(base.min_upload_mbps);
+    let extra_wait_ratio = std::env::var("ANTIGRAVITY_TIMEOUT_UPLOAD_EXTRA_WAIT_RATIO")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(base.extra_wait_ratio);
+    let stall_secs = env_u64("ANTIGRAVITY_TIMEOUT_UPLOAD_STALL_SECS", base.stall_secs);
+    let header_wait_secs = env_u64(
+        "ANTIGRAVITY_TIMEOUT_HEADER_WAIT_SECS",
+        base.header_wait_secs,
+    );
+    let large_body_threshold_mb = env_u64(
+        "ANTIGRAVITY_TIMEOUT_LARGE_BODY_MB",
+        base.large_body_threshold_mb,
+    );
+    let large_body_endpoint_attempts = env_u64(
+        "ANTIGRAVITY_TIMEOUT_LARGE_BODY_ENDPOINT_ATTEMPTS",
+        base.large_body_endpoint_attempts as u64,
+    ) as usize;
+
+    UploadTimeoutConfig {
+        connect_secs,
+        min_upload_mbps,
+        extra_wait_ratio,
+        stall_secs,
+        header_wait_secs,
+        large_body_threshold_mb,
+        large_body_endpoint_attempts,
+    }
+    .normalized()
+}
+
+fn env_u64(key: &str, fallback: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(fallback)
+}
+
+/// 更新全局上传阶段超时配置
+pub fn update_upload_timeout_config(config: UploadTimeoutConfig) {
+    let config = config.normalized();
+    if let Some(lock) = GLOBAL_UPLOAD_TIMEOUT_CONFIG.get() {
+        if let Ok(mut cfg) = lock.write() {
+            if *cfg != config {
+                *cfg = config.clone();
+                tracing::info!(
+                    "[Upstream-Timeouts] Global config updated: connect={}s, min_mbps={:.2}, extra_ratio={:.2}, stall={}s, header_wait={}s, large_body={}MB/{}",
+                    config.connect_secs,
+                    config.min_upload_mbps,
+                    config.extra_wait_ratio,
+                    config.stall_secs,
+                    config.header_wait_secs,
+                    config.large_body_threshold_mb,
+                    config.large_body_endpoint_attempts
+                );
+            }
+        }
+    } else {
+        let _ = GLOBAL_UPLOAD_TIMEOUT_CONFIG.set(RwLock::new(config.clone()));
+        tracing::info!(
+            "[Upstream-Timeouts] Global config initialized: connect={}s, min_mbps={:.2}, extra_ratio={:.2}, stall={}s, header_wait={}s, large_body={}MB/{}",
+            config.connect_secs,
+            config.min_upload_mbps,
+            config.extra_wait_ratio,
+            config.stall_secs,
+            config.header_wait_secs,
+            config.large_body_threshold_mb,
+            config.large_body_endpoint_attempts
+        );
+    }
+}
+
 static GLOBAL_PAYLOAD_STORAGE_MODE: OnceLock<RwLock<String>> = OnceLock::new();
 static GLOBAL_LOG_RETENTION_DAYS: OnceLock<RwLock<u32>> = OnceLock::new();
 static GLOBAL_THINKING_STORE_ENABLED: OnceLock<RwLock<bool>> = OnceLock::new();
 static GLOBAL_THINKING_RETENTION_DAYS: OnceLock<RwLock<u32>> = OnceLock::new();
 static GLOBAL_THINKING_MAX_MEMORY_TURNS: OnceLock<RwLock<u32>> = OnceLock::new();
+static GLOBAL_ENABLE_GLOBAL_COMPACTION_STRIP: OnceLock<RwLock<bool>> = OnceLock::new();
 
 fn write_or_init<T: Clone>(slot: &OnceLock<RwLock<T>>, value: T) {
     if let Some(lock) = slot.get() {
@@ -195,6 +387,18 @@ pub fn is_thinking_store_enabled() -> bool {
         .unwrap_or(true)
 }
 
+pub fn is_global_compaction_strip_enabled() -> bool {
+    GLOBAL_ENABLE_GLOBAL_COMPACTION_STRIP
+        .get()
+        .and_then(|lock| lock.read().ok())
+        .map(|v| *v)
+        .unwrap_or(false)
+}
+
+pub fn set_global_compaction_strip_enabled(enabled: bool) {
+    write_or_init(&GLOBAL_ENABLE_GLOBAL_COMPACTION_STRIP, enabled);
+}
+
 pub fn get_thinking_retention_days() -> u32 {
     GLOBAL_THINKING_RETENTION_DAYS
         .get()
@@ -219,6 +423,7 @@ pub fn update_global_audit_config(
     thinking_store_enabled: bool,
     thinking_retention_days: u32,
     thinking_max_memory_turns: Option<u32>,
+    enable_global_compaction_strip: Option<bool>,
 ) {
     let mode = if payload_storage_mode == "full" {
         "full"
@@ -237,105 +442,17 @@ pub fn update_global_audit_config(
     );
     let max_turns = thinking_max_memory_turns.unwrap_or(600).clamp(10, 10_000);
     write_or_init(&GLOBAL_THINKING_MAX_MEMORY_TURNS, max_turns);
+    let strip_enabled = enable_global_compaction_strip.unwrap_or(false);
+    write_or_init(&GLOBAL_ENABLE_GLOBAL_COMPACTION_STRIP, strip_enabled);
     tracing::info!(
-        "[Audit] storage_mode={}, log_retention_days={}, thinking_store={}, thinking_retention_days={}, thinking_max_memory_turns={}",
+        "[Audit] storage_mode={}, log_retention_days={}, thinking_store={}, thinking_retention_days={}, thinking_max_memory_turns={}, global_compaction_strip={}",
         mode,
         log_retention_days.clamp(1, 3650),
         thinking_store_enabled,
         thinking_retention_days.clamp(1, 3650),
-        max_turns
+        max_turns,
+        strip_enabled
     );
-}
-
-pub fn get_global_threshold_l1() -> f32 {
-    GLOBAL_THRESHOLD_L1
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|v| *v)
-        .unwrap_or(0.6)
-}
-
-pub fn get_global_threshold_l2() -> f32 {
-    GLOBAL_THRESHOLD_L2
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|v| *v)
-        .unwrap_or(0.75)
-}
-
-pub fn get_global_threshold_l3() -> f32 {
-    GLOBAL_THRESHOLD_L3
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|v| *v)
-        .unwrap_or(0.9)
-}
-
-pub fn get_global_compression_level() -> String {
-    let level = GLOBAL_COMPRESSION_LEVEL
-        .get()
-        .and_then(|lock| lock.read().ok())
-        .map(|cfg| cfg.clone())
-        .unwrap_or_else(|| "disabled".to_string());
-
-    if level == "disabled" {
-        let scaling = GLOBAL_USAGE_SCALING
-            .get()
-            .and_then(|lock| lock.read().ok())
-            .map(|s| *s)
-            .unwrap_or(false);
-        if scaling {
-            "high".to_string()
-        } else {
-            "disabled".to_string()
-        }
-    } else {
-        level
-    }
-}
-
-pub fn update_global_compression_level(level: String, scaling: bool) {
-    if let Some(lock) = GLOBAL_COMPRESSION_LEVEL.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = level;
-        }
-    } else {
-        let _ = GLOBAL_COMPRESSION_LEVEL.set(RwLock::new(level));
-    }
-
-    if let Some(lock) = GLOBAL_USAGE_SCALING.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = scaling;
-        }
-    } else {
-        let _ = GLOBAL_USAGE_SCALING.set(RwLock::new(scaling));
-    }
-}
-
-pub fn update_global_thresholds(l1: f32, l2: f32, l3: f32) {
-    if let Some(lock) = GLOBAL_THRESHOLD_L1.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = l1;
-        }
-    } else {
-        let _ = GLOBAL_THRESHOLD_L1.set(RwLock::new(l1));
-    }
-
-    if let Some(lock) = GLOBAL_THRESHOLD_L2.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = l2;
-        }
-    } else {
-        let _ = GLOBAL_THRESHOLD_L2.set(RwLock::new(l2));
-    }
-
-    if let Some(lock) = GLOBAL_THRESHOLD_L3.get() {
-        if let Ok(mut cfg) = lock.write() {
-            *cfg = l3;
-        }
-    } else {
-        let _ = GLOBAL_THRESHOLD_L3.set(RwLock::new(l3));
-    }
 }
 
 /// 全局系统提示词配置
@@ -358,6 +475,216 @@ impl Default for GlobalSystemPromptConfig {
     }
 }
 
+/// 提示词与工具清洗规则的作用范围
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptRewriteScope {
+    /// 全域生效：同时作用于系统提示词与工具描述（默认）
+    All,
+    /// 仅系统提示词生效
+    Prompt,
+    /// 仅工具声明描述生效
+    Tools,
+}
+
+impl Default for PromptRewriteScope {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
+/// 风控提示词清理规则（行式：匹配内容 → 替换为）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptRewriteRule {
+    /// 稳定 ID（前端生成，便于排序/删除）
+    #[serde(default)]
+    pub id: String,
+    /// 匹配内容：支持 `*` 通配符（同一行内任意字符）与 `\n` / `\t` / `\\` 转义
+    #[serde(default)]
+    pub pattern: String,
+    /// 替换内容：留空表示删除匹配内容；支持 `\n` / `\t` / `\\` 转义
+    #[serde(default)]
+    pub replacement: String,
+    /// 规则作用范围：All (全部) | Prompt (仅提示词) | Tools (仅工具描述)
+    #[serde(default)]
+    pub scope: PromptRewriteScope,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl PromptRewriteRule {
+    pub fn new(
+        id: impl Into<String>,
+        pattern: impl Into<String>,
+        replacement: impl Into<String>,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            pattern: pattern.into(),
+            replacement: replacement.into(),
+            scope: PromptRewriteScope::All,
+            enabled,
+        }
+    }
+
+    pub fn with_scope(
+        id: impl Into<String>,
+        pattern: impl Into<String>,
+        replacement: impl Into<String>,
+        scope: PromptRewriteScope,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            pattern: pattern.into(),
+            replacement: replacement.into(),
+            scope,
+            enabled,
+        }
+    }
+}
+
+/// 系统提示词隐身侧载模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptSideloadMode {
+    /// 自动智能探测：包含第三方框架特征或超长指令时自动执行首轮侧载（默认且推荐）
+    Auto,
+    /// 始终开启：所有非空系统提示词一律通过首轮 User 权威上下文侧载
+    Always,
+    /// 关闭：直出传统 systemInstruction
+    Off,
+}
+
+impl Default for PromptSideloadMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// 风控提示词清理方案
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptRewriteConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 是否启用内置身份归一化（默认 true）。关闭后保留客户端原始身份句，只执行用户自定义规则。
+    #[serde(default = "default_true")]
+    pub normalize_identity: bool,
+    /// 系统提示词隐身侧载模式（默认 Auto）
+    #[serde(default)]
+    pub sideload_mode: PromptSideloadMode,
+    /// 是否对工具描述 (tools[].functionDeclarations[].description) 同步执行清洗与自定义规则替换 (默认 true)
+    #[serde(default = "default_true")]
+    pub sanitize_tools_description: bool,
+    #[serde(default = "PromptRewriteConfig::recommended_preset_rules")]
+    pub rules: Vec<PromptRewriteRule>,
+}
+
+impl PromptRewriteConfig {
+    /// 官方推荐的内置风控预设规则集（经过生产环境与 WAF 实测验证）
+    pub fn recommended_preset_rules() -> Vec<PromptRewriteRule> {
+        vec![
+            PromptRewriteRule::with_scope(
+                "preset-opencode",
+                "You are an AI agent running in OpenCode*",
+                "",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-claude-code-agent",
+                "You are an interactive agent that helps users with software engineering tasks*",
+                "",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-opencode-session-move",
+                "*tools.opencode.session*move*",
+                "tools.opencode.session_relocate",
+                PromptRewriteScope::All,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-dsh-identity",
+                "You are an AI agent powered by DeepSeek Harness*",
+                "",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-dsh-model",
+                "You are a coding agent powered by *gemini*",
+                "",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-dsh-browser-context",
+                "*The browser provides no implicit DOM, route, or screenshot context*",
+                "The browser exposes no DOM tree, route list, or page screenshot context",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-workbuddy",
+                "*WorkBuddy*",
+                "",
+                PromptRewriteScope::All,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-workbuddy-powered-by",
+                "*This conversation is powered by *",
+                "Selected model: ",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-codex-desktop-context",
+                "*# Codex desktop context*",
+                "# Desktop application context",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-codex-as-role",
+                "*as Codex:*",
+                "as an assistant:",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-codex-intro",
+                "*the codex cli is an open*source project*",
+                "",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+            PromptRewriteRule::with_scope(
+                "preset-anthropic-billing",
+                "*x-anthropic-billing-header:*",
+                "",
+                PromptRewriteScope::Prompt,
+                true,
+            ),
+        ]
+    }
+}
+
+impl Default for PromptRewriteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            normalize_identity: true,
+            sideload_mode: PromptSideloadMode::default(),
+            sanitize_tools_description: true,
+            rules: Self::recommended_preset_rules(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyAuthMode {
@@ -370,105 +697,6 @@ pub enum ProxyAuthMode {
 impl Default for ProxyAuthMode {
     fn default() -> Self {
         Self::Auto
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ZaiDispatchMode {
-    /// Never use z.ai.
-    Off,
-    /// Use z.ai for all Anthropic protocol requests.
-    Exclusive,
-    /// Treat z.ai as one additional slot in the shared pool.
-    Pooled,
-    /// Use z.ai only when the Google pool is unavailable.
-    Fallback,
-}
-
-impl Default for ZaiDispatchMode {
-    fn default() -> Self {
-        Self::Off
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZaiModelDefaults {
-    /// Default model for "opus" family (when the incoming model is a Claude id).
-    #[serde(default = "default_zai_opus_model")]
-    pub opus: String,
-    /// Default model for "sonnet" family (when the incoming model is a Claude id).
-    #[serde(default = "default_zai_sonnet_model")]
-    pub sonnet: String,
-    /// Default model for "haiku" family (when the incoming model is a Claude id).
-    #[serde(default = "default_zai_haiku_model")]
-    pub haiku: String,
-}
-
-impl Default for ZaiModelDefaults {
-    fn default() -> Self {
-        Self {
-            opus: default_zai_opus_model(),
-            sonnet: default_zai_sonnet_model(),
-            haiku: default_zai_haiku_model(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZaiMcpConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub web_search_enabled: bool,
-    #[serde(default)]
-    pub web_reader_enabled: bool,
-    #[serde(default)]
-    pub vision_enabled: bool,
-}
-
-impl Default for ZaiMcpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            web_search_enabled: false,
-            web_reader_enabled: false,
-            vision_enabled: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ZaiConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_zai_base_url")]
-    pub base_url: String,
-    #[serde(default)]
-    pub api_key: String,
-    #[serde(default)]
-    pub dispatch_mode: ZaiDispatchMode,
-    /// Optional per-model mapping overrides for Anthropic/Claude model ids.
-    /// Key: incoming `model` string, Value: upstream z.ai model id (e.g. `glm-4.7`).
-    #[serde(default)]
-    pub model_mapping: HashMap<String, String>,
-    #[serde(default)]
-    pub models: ZaiModelDefaults,
-    #[serde(default)]
-    pub mcp: ZaiMcpConfig,
-}
-
-impl Default for ZaiConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: default_zai_base_url(),
-            api_key: String::new(),
-            dispatch_mode: ZaiDispatchMode::Off,
-            model_mapping: HashMap::new(),
-            models: ZaiModelDefaults::default(),
-            mcp: ZaiMcpConfig::default(),
-        }
     }
 }
 
@@ -487,28 +715,9 @@ pub struct ExperimentalConfig {
     #[serde(default = "default_true")]
     pub enable_cross_model_checks: bool,
 
-    /// 启用上下文用量缩放 (Context Usage Scaling)
-    /// 激进模式: 缩放用量并激活自动压缩以突破 200k 限制
-    /// 默认关闭以保持透明度,让客户端能触发原生压缩指令
+    /// 默认关闭。只影响回给客户端的用量数字，不改写上下文。
     #[serde(default = "default_false")]
     pub enable_usage_scaling: bool,
-
-    /// 压缩级别 (Compression Level)
-    /// disabled, low, medium, high
-    #[serde(default = "default_compression_level")]
-    pub compression_level: String,
-
-    /// 上下文压缩阈值 L1 (Tool Trimming)
-    #[serde(default = "default_threshold_l1")]
-    pub context_compression_threshold_l1: f32,
-
-    /// 上下文压缩阈值 L2 (Thinking Compression)
-    #[serde(default = "default_threshold_l2")]
-    pub context_compression_threshold_l2: f32,
-
-    /// 上下文压缩阈值 L3 (Fork + Summary)
-    #[serde(default = "default_threshold_l3")]
-    pub context_compression_threshold_l3: f32,
 
     /// 监控报文体存储模式: `simple`（默认，精简落库）或 `full`（原文）
     #[serde(default = "default_payload_storage_mode")]
@@ -529,6 +738,22 @@ pub struct ExperimentalConfig {
     /// 每轮会话在内存中保留的最大思考块轮次（默认 600，滑动窗口淘汰并由 SQLite 索引承接）
     #[serde(default = "default_thinking_max_memory_turns")]
     pub thinking_max_memory_turns: u32,
+
+    /// Claude Desktop Cowork 模式自动响应式自愈压缩 (Auto Reactive Compact for Cowork)
+    #[serde(default = "default_false")]
+    pub enable_cowork_auto_compact: bool,
+
+    /// Cowork 自动响应式压缩触发阈值 (默认 200,000 Tokens)
+    #[serde(default = "default_cowork_compact_threshold")]
+    pub cowork_compact_threshold: u32,
+
+    /// 启用 Claude Cowork 手动深度归档协议支持 (高危选项，默认 false)
+    #[serde(default = "default_false")]
+    pub enable_cowork_manual_compact: bool,
+
+    /// 全局压缩剥离签名 (Global Compaction Signature Stripping) (试验性选项，默认 false)
+    #[serde(default = "default_false")]
+    pub enable_global_compaction_strip: bool,
 }
 
 impl Default for ExperimentalConfig {
@@ -538,31 +763,23 @@ impl Default for ExperimentalConfig {
             enable_tool_loop_recovery: false,
             enable_cross_model_checks: true,
             enable_usage_scaling: false,
-            compression_level: "disabled".to_string(),
-            context_compression_threshold_l1: 0.4,
-            context_compression_threshold_l2: 0.55,
-            context_compression_threshold_l3: 0.7,
             payload_storage_mode: default_payload_storage_mode(),
             log_retention_days: default_log_retention_days(),
             thinking_store_enabled: default_thinking_store_enabled(),
             thinking_retention_days: default_thinking_retention_days(),
             thinking_max_memory_turns: default_thinking_max_memory_turns(),
+            enable_cowork_auto_compact: false,
+            cowork_compact_threshold: default_cowork_compact_threshold(),
+            enable_cowork_manual_compact: false,
+            enable_global_compaction_strip: false,
         }
     }
 }
 
-fn default_threshold_l1() -> f32 {
-    0.4
+fn default_cowork_compact_threshold() -> u32 {
+    200_000
 }
-fn default_threshold_l2() -> f32 {
-    0.55
-}
-fn default_threshold_l3() -> f32 {
-    0.7
-}
-fn default_compression_level() -> String {
-    "disabled".to_string()
-}
+
 fn default_payload_storage_mode() -> String {
     "simple".to_string()
 }
@@ -624,13 +841,17 @@ impl Default for ThinkingBudgetMode {
 }
 
 /// Thinking Budget 配置
+///
+/// 官方模型目录已收录的模型完全由官方 `thinkingBudget` / `thinkingLevel` 驱动；
+/// 这里的数值仅作为「官方目录未收录的实验模型」的兜底，且必须 `mode = Custom`。
+/// 设置界面已不再暴露这些字段，保留仅为兼容旧配置与 headless 用户。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingBudgetConfig {
     /// 控制权大选择：网关控制 vs 客户端控制
     #[serde(default = "default_control_source")]
     pub control_source: ThinkingControlSource,
 
-    // --- Gemini Flash 系列配置 ---
+    // --- Gemini Flash 系列配置（仅对官方目录未收录模型生效）---
     #[serde(default = "default_thinking_budget_mode")]
     pub flash_mode: ThinkingBudgetMode,
     #[serde(default = "default_flash_low")]
@@ -638,7 +859,13 @@ pub struct ThinkingBudgetConfig {
     #[serde(default = "default_flash_medium")]
     pub flash_medium: i32, // 默认 4000
     #[serde(default = "default_flash_high")]
-    pub flash_high: i32, // 默认 10000
+    pub flash_high: i32, // 默认 -1，走官方模型结构体
+    /// 旧默认值 16384 已迁移为官方 -1。置位后不再重复改写用户后来手选的 16384。
+    #[serde(default)]
+    pub flash_high_legacy_migrated: bool,
+    /// 旧默认值 32768 已迁移为官方 -1。置位后配置迁移不再重复落盘改写 gui_config.json。
+    #[serde(default)]
+    pub thinking_budget_32k_legacy_migrated: bool,
     #[serde(default = "default_flash_tiered")]
     pub flash_tiered: i32, // 默认 -1
 
@@ -662,7 +889,7 @@ pub struct ThinkingBudgetConfig {
     #[serde(default = "default_claude_high")]
     pub claude_high: i32, // 默认 16000
 
-    // --- 历史向后兼容字段 ---
+    // --- 历史向后兼容字段（仅对官方目录未收录模型生效）---
     #[serde(default = "default_thinking_budget_mode")]
     pub mode: ThinkingBudgetMode,
     #[serde(default = "default_thinking_budget_custom_value")]
@@ -673,7 +900,7 @@ pub struct ThinkingBudgetConfig {
     pub custom_low: i32,
     #[serde(default = "default_flash_medium")]
     pub custom_medium: i32,
-    #[serde(default = "default_flash_high")]
+    #[serde(default = "default_custom_high")]
     pub custom_high: i32,
     #[serde(default = "default_flash_tiered")]
     pub custom_tiered: i32,
@@ -688,36 +915,40 @@ fn default_thinking_budget_mode() -> ThinkingBudgetMode {
 }
 
 fn default_flash_low() -> i32 {
-    1024
+    -1
 }
 fn default_flash_medium() -> i32 {
-    4096
+    -1
 }
 fn default_flash_high() -> i32 {
-    16384
+    -1
+}
+
+fn default_custom_high() -> i32 {
+    -1
 }
 fn default_flash_tiered() -> i32 {
     -1
 }
 
 fn default_pro_low() -> i32 {
-    1001
+    -1
 }
 fn default_pro_high() -> i32 {
-    10001
+    -1
 }
 
 fn default_claude_budget() -> i32 {
-    16384
+    -1 // -1 = 采用官方默认的档位预算
 }
 fn default_claude_low() -> i32 {
-    1024
+    -1
 }
 fn default_claude_medium() -> i32 {
-    4096
+    -1
 }
 fn default_claude_high() -> i32 {
-    16384
+    -1
 }
 
 impl Default for ThinkingBudgetConfig {
@@ -728,6 +959,8 @@ impl Default for ThinkingBudgetConfig {
             flash_low: default_flash_low(),
             flash_medium: default_flash_medium(),
             flash_high: default_flash_high(),
+            flash_high_legacy_migrated: false,
+            thinking_budget_32k_legacy_migrated: false,
             flash_tiered: default_flash_tiered(),
 
             pro_mode: default_thinking_budget_mode(),
@@ -745,7 +978,7 @@ impl Default for ThinkingBudgetConfig {
             effort: None,
             custom_low: default_flash_low(),
             custom_medium: default_flash_medium(),
-            custom_high: default_flash_high(),
+            custom_high: default_custom_high(),
             custom_tiered: default_flash_tiered(),
         }
     }
@@ -776,6 +1009,206 @@ impl Default for DebugLoggingConfig {
         Self {
             enabled: false,
             output_dir: None,
+        }
+    }
+}
+
+fn default_sliding_strategy() -> String {
+    "count".to_string()
+}
+
+/// 多模态交互与保鲜滑窗配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MultimodalConfig {
+    /// 是否启用多模态历史保鲜滑动窗口 (默认开启，自动防范长上下文堆积多图导致请求体膨胀及 504)
+    #[serde(default = "default_enable_sliding_window")]
+    pub enable_sliding_window: bool,
+
+    /// 保鲜策略模式: "count" (按图片张数) 或 "memory" (按累积内存大小)
+    #[serde(default = "default_sliding_strategy")]
+    pub strategy: String,
+
+    /// 滑动窗口保鲜最大图片张数（默认 5，填 0 为不限张数）
+    #[serde(default = "default_max_fresh_images")]
+    pub max_fresh_images: usize,
+
+    /// 历史图片剥离时，是否一并剥离远程 / OSS 直链图片 (默认关闭，默认仅剥离 Base64)
+    #[serde(default)]
+    pub strip_remote_urls: bool,
+
+    /// 多模态图片累积最大解码容量限制 (MB，默认 32MB，物理防爆安全红线)
+    #[serde(default = "default_max_total_image_mb")]
+    pub max_total_image_mb: usize,
+}
+
+fn default_enable_sliding_window() -> bool {
+    true
+}
+
+fn default_max_fresh_images() -> usize {
+    5
+}
+
+fn default_max_total_image_mb() -> usize {
+    32
+}
+
+impl Default for MultimodalConfig {
+    fn default() -> Self {
+        Self {
+            enable_sliding_window: default_enable_sliding_window(),
+            strategy: default_sliding_strategy(),
+            max_fresh_images: default_max_fresh_images(),
+            strip_remote_urls: false,
+            max_total_image_mb: default_max_total_image_mb(),
+        }
+    }
+}
+
+/// 上游超时配置（连接期 / 上传阶段 / 首响应头 / 大文件重试）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UploadTimeoutConfig {
+    /// 连接期看门狗（每个端点独立建连时限，秒，默认 10s）；超时即切换下一端点。
+    /// 该值在 HTTP 客户端构建时生效，修改后需重启代理服务
+    #[serde(default = "default_connect_secs")]
+    pub connect_secs: u64,
+
+    /// 上传带宽下限（Mbps，默认 0.8，推荐 0.5-5 Mbps）
+    ///
+    /// 语义是「声明的最慢上行」：预算 = 请求体大小 ÷ 该值 × (1 + 额外等待系数)，
+    /// 因此**调大该值会缩短上传预算**；实测比声明值更慢时只会放宽、不会收紧。
+    #[serde(default = "default_min_upload_mbps")]
+    pub min_upload_mbps: f64,
+
+    /// 额外等待系数（默认 0.4；最大等待时间 = 大小 ÷ 带宽 × (1 + 系数)）
+    #[serde(default = "default_extra_wait_ratio")]
+    pub extra_wait_ratio: f64,
+
+    /// 停滞超时（秒，默认 45s）。完全没有字节进展超过该时长中断；若最大等待时间更短则取较短者
+    #[serde(default = "default_upload_stall_secs")]
+    pub stall_secs: u64,
+
+    /// 已废弃：仅为配置 round-trip 保留，不再参与首字预算。
+    ///
+    /// 「首响应头」与「首字」已合并为统一首字延迟（TTFB≡TTFT），唯一来源是
+    /// [`StreamTimeoutConfig::initial_ttft_secs`] + 按 token 规模的自适应下限；
+    /// 媒体增量：常规 +0 / 图片 +45 / 视频 +60 / 辅助 −30，备用端点增量减半。
+    /// 新配置请只使用 `initial_ttft_secs`。
+    #[serde(default = "default_header_wait_secs")]
+    pub header_wait_secs: u64,
+
+    /// 大文件判定阈值（MB，默认 8MB）
+    #[serde(default = "default_large_body_threshold_mb")]
+    pub large_body_threshold_mb: u64,
+
+    /// 大文件最多尝试次数（默认 1；默认只发一次，避免反复重传占满上行）
+    #[serde(default = "default_large_body_endpoint_attempts")]
+    pub large_body_endpoint_attempts: usize,
+}
+
+fn default_connect_secs() -> u64 {
+    10
+}
+
+fn default_min_upload_mbps() -> f64 {
+    0.8
+}
+
+fn default_extra_wait_ratio() -> f64 {
+    0.4
+}
+
+fn default_upload_stall_secs() -> u64 {
+    45
+}
+
+fn default_header_wait_secs() -> u64 {
+    0
+}
+
+fn default_large_body_threshold_mb() -> u64 {
+    8
+}
+
+fn default_large_body_endpoint_attempts() -> usize {
+    1
+}
+
+impl Default for UploadTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            connect_secs: default_connect_secs(),
+            min_upload_mbps: default_min_upload_mbps(),
+            extra_wait_ratio: default_extra_wait_ratio(),
+            stall_secs: default_upload_stall_secs(),
+            header_wait_secs: default_header_wait_secs(),
+            large_body_threshold_mb: default_large_body_threshold_mb(),
+            large_body_endpoint_attempts: default_large_body_endpoint_attempts(),
+        }
+    }
+}
+
+impl UploadTimeoutConfig {
+    /// 归一化非法配置，避免 0 值或倒挂阈值导致发送阶段瞬间自断
+    pub fn normalized(mut self) -> Self {
+        self.connect_secs = self.connect_secs.clamp(3, 120);
+        self.min_upload_mbps = if self.min_upload_mbps.is_finite() {
+            self.min_upload_mbps.clamp(0.1, 1000.0)
+        } else {
+            default_min_upload_mbps()
+        };
+        self.extra_wait_ratio = if self.extra_wait_ratio.is_finite() {
+            self.extra_wait_ratio.clamp(0.0, 10.0)
+        } else {
+            default_extra_wait_ratio()
+        };
+        self.stall_secs = self.stall_secs.clamp(5, 600);
+        self.header_wait_secs = self.header_wait_secs.min(600);
+        self.large_body_threshold_mb = self.large_body_threshold_mb.max(1);
+        self.large_body_endpoint_attempts = self.large_body_endpoint_attempts.max(1);
+        self
+    }
+
+    /// 大体积请求阈值（字节）
+    pub fn large_body_threshold_bytes(&self) -> usize {
+        (self.large_body_threshold_mb as usize).saturating_mul(1024 * 1024)
+    }
+}
+
+/// 流式梯度超时配置 (首字响应、状态切换、推流滑动)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamTimeoutConfig {
+    /// 首字响应宽限时长（秒，默认 180s）
+    #[serde(default = "default_initial_ttft_secs")]
+    pub initial_ttft_secs: u64,
+
+    /// 思考至正文/工具调用的状态切换宽限时长（秒，默认 180s）
+    #[serde(default = "default_transition_secs")]
+    pub transition_secs: u64,
+
+    /// 稳态推流相邻 Token 滑动窗口超时（秒，默认 120s）
+    #[serde(default = "default_streaming_sliding_secs")]
+    pub streaming_sliding_secs: u64,
+}
+
+pub fn default_initial_ttft_secs() -> u64 {
+    180
+}
+
+pub fn default_transition_secs() -> u64 {
+    180
+}
+
+pub fn default_streaming_sliding_secs() -> u64 {
+    120
+}
+
+impl Default for StreamTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            initial_ttft_secs: default_initial_ttft_secs(),
+            transition_secs: default_transition_secs(),
+            streaming_sliding_secs: default_streaming_sliding_secs(),
         }
     }
 }
@@ -926,8 +1359,17 @@ pub struct ProxyConfig {
     pub auto_start: bool,
 
     /// 自定义精确模型映射表 (key: 原始模型名, value: 目标模型名)
-    #[serde(default)]
+    #[serde(default = "default_custom_mapping")]
     pub custom_mapping: std::collections::HashMap<String, String>,
+
+    /// 自定义模型对外暴露状态 (key: 原始模型名, value: 是否对外暴露)
+    /// 默认精确条目对外暴露 (true)，内置兼容暗路由规则不暴露 (false)
+    #[serde(default = "default_custom_mapping_expose")]
+    pub custom_mapping_expose: std::collections::HashMap<String, bool>,
+
+    /// 内置映射版本号，用于无感迁移与防复活保障
+    #[serde(default = "default_builtin_mapping_version")]
+    pub builtin_mapping_version: u32,
 
     /// API 请求超时时间(秒)
     #[serde(default = "default_request_timeout")]
@@ -937,8 +1379,16 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub enable_logging: bool,
 
+    /// 是否捕获健康检查日志 (默认 false: 对 GET 成功请求与第三方网关探活探测全部过滤且不入库)
+    #[serde(default)]
+    pub capture_health_logs: bool,
+
     #[serde(default)]
     pub log_retention: LogRetentionConfig,
+
+    /// 内部失败日志（error.log*）滑动窗口容量
+    #[serde(default)]
+    pub internal_error_log_retention: InternalErrorLogRetentionConfig,
 
     /// 调试日志配置 (保存完整链路)
     #[serde(default)]
@@ -952,13 +1402,17 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub only_raw_quota_models: bool,
 
-    /// z.ai provider configuration (Anthropic-compatible).
-    #[serde(default)]
-    pub zai: ZaiConfig,
-
     /// 自定义 User-Agent 请求头 (可选覆盖)
     #[serde(default)]
     pub user_agent_override: Option<String>,
+
+    /// 官方 Hub 版本自定义覆盖 (如 "2.23.1")
+    #[serde(default)]
+    pub hub_version: Option<String>,
+
+    /// 官方构建提交编号 (CL) 自定义覆盖 (如 "998881661")
+    #[serde(default)]
+    pub hub_cl: Option<String>,
 
     /// 账号调度配置 (粘性会话/限流重试)
     #[serde(default)]
@@ -992,6 +1446,10 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub global_system_prompt: GlobalSystemPromptConfig,
 
+    /// 风控提示词清理方案（作用于首个真实 user 提问前的提示词块）
+    #[serde(default)]
+    pub prompt_rewrite: PromptRewriteConfig,
+
     /// 图像思维模式配置
     /// - enabled: 保留思维链 (默认)
     /// - disabled: 移除思维链 (画质优先)
@@ -1005,6 +1463,24 @@ pub struct ProxyConfig {
     /// 代理池配置
     #[serde(default)]
     pub proxy_pool: ProxyPoolConfig,
+
+    /// 多模态交互与保鲜滑窗配置
+    #[serde(default)]
+    pub multimodal: MultimodalConfig,
+
+    /// 流式梯度超时配置 (首字响应、状态切换、推流滑动)
+    #[serde(default)]
+    pub stream_timeouts: StreamTimeoutConfig,
+
+    /// 上游发送阶段分级超时配置 (连接 → 上传 → 等待响应头)
+    #[serde(default)]
+    pub upload_timeouts: UploadTimeoutConfig,
+
+    /// 遇到限流账号自动进小黑屋 (QoS 降速熔断守卫)
+    /// - false: 默认关闭。直接忽略校验时长，不标记疑似限速，不进小黑屋，不解绑会话。
+    /// - true: 开启。当账号 TTFT 显著异常时标记疑似限速，累计超标关入小黑屋并解绑会话。
+    #[serde(default)]
+    pub qos_auto_jail: bool,
 }
 
 /// Request log retention policy.
@@ -1064,6 +1540,43 @@ impl Default for LogRetentionConfig {
     }
 }
 
+/// Internal ERROR log file retention (error.log / error.log.YYYY-MM-DD).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternalErrorLogRetentionConfig {
+    /// Disk budget in MiB. Over limit, evict oldest 30% and keep appending.
+    #[serde(default = "default_internal_error_max_storage_mb")]
+    pub max_storage_mb: u64,
+}
+
+fn default_internal_error_max_storage_mb() -> u64 {
+    500
+}
+
+impl InternalErrorLogRetentionConfig {
+    /// `ABV_INTERNAL_ERROR_LOG_MB` overrides the config file when set to a positive integer.
+    pub fn budget_bytes(&self) -> u64 {
+        let mb = std::env::var("ABV_INTERNAL_ERROR_LOG_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(self.max_storage_mb);
+        let mb = if mb == 0 {
+            default_internal_error_max_storage_mb()
+        } else {
+            mb
+        };
+        mb.saturating_mul(1024 * 1024)
+    }
+}
+
+impl Default for InternalErrorLogRetentionConfig {
+    fn default() -> Self {
+        Self {
+            max_storage_mb: default_internal_error_max_storage_mb(),
+        }
+    }
+}
+
 /// 上游代理配置
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpstreamProxyConfig {
@@ -1071,6 +1584,32 @@ pub struct UpstreamProxyConfig {
     pub enabled: bool,
     /// 代理地址 (http://, https://, socks5://)
     pub url: String,
+}
+
+pub fn default_builtin_mapping_version() -> u32 {
+    1
+}
+
+pub fn default_custom_mapping() -> std::collections::HashMap<String, String> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("claude-fable-*".to_string(), "auto:claude-opus".to_string());
+    m.insert(
+        "claude-opus-4-7*".to_string(),
+        "auto:claude-opus-4-7".to_string(),
+    );
+    m.insert(
+        "claude-haiku-*".to_string(),
+        "auto:gemini-flash-low".to_string(),
+    );
+    m
+}
+
+pub fn default_custom_mapping_expose() -> std::collections::HashMap<String, bool> {
+    let mut m = std::collections::HashMap::new();
+    m.insert("claude-fable-*".to_string(), false);
+    m.insert("claude-opus-4-7*".to_string(), false);
+    m.insert("claude-haiku-*".to_string(), false);
+    m
 }
 
 impl Default for ProxyConfig {
@@ -1083,47 +1622,41 @@ impl Default for ProxyConfig {
             api_key: format!("sk-{}", uuid::Uuid::new_v4().simple()),
             admin_password: None,
             auto_start: false,
-            custom_mapping: std::collections::HashMap::new(),
+            custom_mapping: default_custom_mapping(),
+            custom_mapping_expose: default_custom_mapping_expose(),
+            builtin_mapping_version: default_builtin_mapping_version(),
             request_timeout: default_request_timeout(),
-            enable_logging: true, // 默认开启，支持 token 统计功能
+            enable_logging: true,       // 默认开启，支持 token 统计功能
+            capture_health_logs: false, // 默认关闭，过滤 GET 探活与第三方网关探测请求且不入库
             log_retention: LogRetentionConfig::default(),
+            internal_error_log_retention: InternalErrorLogRetentionConfig::default(),
             debug_logging: DebugLoggingConfig::default(),
             upstream_proxy: UpstreamProxyConfig::default(),
             only_raw_quota_models: false,
-            zai: ZaiConfig::default(),
             scheduling: crate::proxy::sticky_config::StickySessionConfig::default(),
             experimental: ExperimentalConfig::default(),
             security_monitor: SecurityMonitorConfig::default(),
             preferred_account_id: None, // 默认使用轮询模式
             user_agent_override: None,
+            hub_version: None,
+            hub_cl: None,
             saved_user_agent: None,
             thinking_budget: ThinkingBudgetConfig::default(),
             global_system_prompt: GlobalSystemPromptConfig::default(),
+            prompt_rewrite: PromptRewriteConfig::default(),
             proxy_pool: ProxyPoolConfig::default(),
+            multimodal: MultimodalConfig::default(),
+            stream_timeouts: StreamTimeoutConfig::default(),
+            upload_timeouts: UploadTimeoutConfig::default(),
             image_thinking_mode: None,
             image_scheduler: ImageSchedulerConfig::default(),
+            qos_auto_jail: false,
         }
     }
 }
 
 fn default_request_timeout() -> u64 {
     120 // 默认 120 秒,原来 60 秒太短
-}
-
-fn default_zai_base_url() -> String {
-    "https://api.z.ai/api/anthropic".to_string()
-}
-
-fn default_zai_opus_model() -> String {
-    "glm-4.7".to_string()
-}
-
-fn default_zai_sonnet_model() -> String {
-    "glm-4.7".to_string()
-}
-
-fn default_zai_haiku_model() -> String {
-    "glm-4.5-air".to_string()
 }
 
 impl ProxyConfig {
@@ -1248,5 +1781,33 @@ mod tests {
         // 测试边缘情况
         assert_eq!(normalize_proxy_url(""), "");
         assert_eq!(normalize_proxy_url("   "), "");
+    }
+
+    #[test]
+    fn upload_timeout_config_roundtrip_and_normalization() {
+        let cfg = UploadTimeoutConfig {
+            connect_secs: 0,
+            min_upload_mbps: 0.0,
+            extra_wait_ratio: 99.0,
+            stall_secs: 1,
+            header_wait_secs: 999,
+            large_body_threshold_mb: 0,
+            large_body_endpoint_attempts: 0,
+        };
+        let normalized = cfg.clone().normalized();
+        assert_eq!(normalized.connect_secs, 3);
+        assert_eq!(normalized.min_upload_mbps, 0.1);
+        assert_eq!(normalized.extra_wait_ratio, 10.0);
+        assert_eq!(normalized.stall_secs, 5);
+        assert_eq!(normalized.header_wait_secs, 600);
+        assert_eq!(normalized.large_body_threshold_mb, 1);
+        assert_eq!(normalized.large_body_endpoint_attempts, 1);
+
+        // 配置必须完整 round-trip；缺失字段回退默认值，不得静默丢字段。
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: UploadTimeoutConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+        let partial: UploadTimeoutConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(partial, UploadTimeoutConfig::default());
     }
 }

@@ -1,12 +1,6 @@
 // Claude 辅助函数
 // JSON Schema 清理、签名处理等
 
-// 已移除未使用的 Value 导入
-
-/// 将 JSON Schema 中的类型名称转为大写 (Gemini 要求)
-/// 例如: "string" -> "STRING", "integer" -> "INTEGER"
-// 已移除未使用的 uppercase_schema_types 函数
-
 /// 根据模型名称获取上下文 Token 限制
 pub fn get_context_limit_for_model(model: &str) -> u32 {
     if model.contains("pro") {
@@ -36,11 +30,9 @@ pub fn to_claude_usage(
         cache_read_input_tokens: val["cache_read_input_tokens"].as_u64().map(|v| v as u32),
         cache_creation_input_tokens: Some(0),
         server_tool_use: None,
+        ..Default::default()
     }
 }
-
-/// 提取 thoughtSignature
-// 已移除未使用的 extract_thought_signature 函数
 
 #[cfg(test)]
 mod tests {

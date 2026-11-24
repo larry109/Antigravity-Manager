@@ -1,5 +1,9 @@
 # Security hardening — divergence from upstream
 
+> **Rebased on upstream `v5.0.4` (2026-11-25).** Each fix below was re-checked against
+> the new code; the per-item status notes say what upstream fixed on its own, what was
+> re-applied, and what had to be adapted.
+
 This fork tracks [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)
 and carries a set of security fixes on top of it. This file exists so that a future
 `git merge upstream/main` is easy to reason about: it lists every place where this
@@ -43,6 +47,13 @@ only the TCP peer address counts. Put your reverse proxy there (`127.0.0.1`, `::
 for nginx/Caddy/cloudflared on the same host) to get real client IPs in the logs again.
 
 ### 3. OAuth callback validates the `state` parameter
+
+*v5.0.4 status: upstream now compares `state` **only when a login flow is pending**; with
+no pending flow it still exchanges any `code` it receives, which is the same login-CSRF
+sink. Re-applied as: no pending flow → refuse. Upstream also interpolated the
+attacker-controlled `error_description` query parameter raw into the HTML page
+(reflected XSS on the proxy origin); it is now escaped like the other error strings (#11).*
+
 `src-tauri/src/proxy/server.rs`, `src-tauri/src/modules/oauth_server.rs`
 
 `/auth/callback` is public by necessity and ignored the `state` parameter (the field
@@ -70,6 +81,10 @@ text** — had no IP filtering at all. It now gets the same layer, running befor
 matching prefix length through response timing. `constant_time_eq` compares every byte.
 
 ### 6. `/internal/*` is restricted to loopback
+
+*v5.0.4 status: fixed upstream (`ip_filter::is_direct_loopback`, checked before any auth
+mode, non-loopback → 403). Upstream's version is kept; it is stricter than ours.*
+
 `src-tauri/src/proxy/middleware/auth.rs`
 
 `/internal/warmup` bypassed authentication unconditionally, so on an exposed instance
@@ -125,29 +140,12 @@ is provided.
 
 Upstream error strings were interpolated raw into HTML. Now escaped via `html_escape`.
 
-### 12. A single account can no longer retry a 429 forever
-`src-tauri/src/proxy/handlers/common.rs`
-
-Not a security issue but an availability one, found in production with one Google
-account behind a public site. A 429 on a single-account pool always returned
-`GraceRetry`, and `next_rotation_attempt` does not count grace retries against
-`max_attempts`. As long as Google kept answering 429 — with or without a retry delay —
-the request looped every 3 s and never failed, so the client waited indefinitely and
-could not fall back to anything else.
-
-The multi-account branch already limited grace retries to one per account through
-`RequestRetryState::grace_retried_accounts`; the single-account branch now honours the
-same `allow_grace_retry` flag and falls back to a counted `FixedDelay` afterwards. A
-persistent 429 now ends after `calculate_max_retry_attempts(1)` = 3 counted attempts
-(4 upstream calls). Covered by `single_account_429_without_delay_is_bounded`; the
-existing `task_short_429_preserves_rotation_budget_and_structured_status` also relied
-on this bound and hung before the fix (CI compiles tests but never runs them).
-
-Note: the `allow_grace` value computed from `scheduling.mode` in `handlers/gemini.rs`
-and `handlers/openai.rs` is never used, so switching to `PerformanceFirst` did **not**
-work around this bug. Left as is.
-
 ## Known issues deliberately NOT changed
+
+- **macOS Keychain item for the JetBrains ACP plugin is still created with `-A`**
+  (`modules/integration.rs`, `antigravity-acp`, added upstream after 4.7.10). The reader is
+  the plugin's own `agy_acp_server`, not an Antigravity app, so the `-T` list used in #9
+  would not cover it and would break the plugin. Same partial-fix caveat as #9 applies.
 
 These were found during the audit and left alone on purpose — fixing them would cost
 functionality or needs a refactor rather than a patch.
@@ -172,6 +170,16 @@ functionality or needs a refactor rather than a patch.
   `rquest`, device-fingerprint falsification.** These are the purpose of the tool, not
   defects. They are also the most likely real-world risk to you: **Google account
   suspension**. Use throwaway accounts.
+
+## Prompt rewriting (upstream v5 default) — disable for API use
+
+Upstream v5 rewrites prompts by default: `prompt_rewrite.sideload_mode: auto` moves any
+system prompt longer than 300 characters into the first user turn wrapped in a
+`[SYSTEM MANDATE]` block, and `normalize_identity: true` replaces "You are …" identity
+sentences with the official Antigravity identity. That is meant for coding agents (Cursor,
+Cline, OpenCode); for an application that owns its prompt (a site persona, an assistant)
+it silently changes behaviour. Set `"sideload_mode": "off"` and
+`"normalize_identity": false` under `proxy.prompt_rewrite` (or `ABV_NORMALIZE_IDENTITY=off`).
 
 ## Recommended configuration
 

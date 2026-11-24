@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Claude API 请求
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClaudeRequest {
     pub model: String,
     pub messages: Vec<Message>,
@@ -14,7 +14,12 @@ pub struct ClaudeRequest {
     pub tools: Option<Vec<Tool>>,
     #[serde(default)]
     pub stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "maxTokens",
+        alias = "max_completion_tokens",
+        alias = "maxCompletionTokens"
+    )]
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
@@ -34,18 +39,29 @@ pub struct ClaudeRequest {
     pub size: Option<String>,
     #[serde(default)]
     pub quality: Option<String>,
+    /// Tool choice for forced or selective tool calling
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<serde_json::Value>,
 }
 
 /// Thinking 配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ThinkingConfig {
     #[serde(rename = "type")]
     pub type_: String, // "enabled" or "adaptive"
-    #[serde(alias = "budgetTokens")]
+    #[serde(
+        default,
+        rename = "budget_tokens",
+        alias = "budgetTokens",
+        alias = "max_tokens",
+        alias = "maxTokens"
+    )]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>, // "low", "high", or "max"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>, // "omitted", "summarized", or "highlights"
 }
 
 /// System Prompt
@@ -114,6 +130,7 @@ pub enum ContentBlock {
     ToolUse {
         id: String,
         name: String,
+        #[serde(default = "default_empty_object")]
         input: serde_json::Value,
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
@@ -124,6 +141,7 @@ pub enum ContentBlock {
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
+        #[serde(default)]
         content: serde_json::Value, // Changed from String to Value to support Array of Blocks
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
@@ -133,14 +151,20 @@ pub enum ContentBlock {
     ServerToolUse {
         id: String,
         name: String,
+        #[serde(default = "default_empty_object")]
         input: serde_json::Value,
     },
 
     #[serde(rename = "web_search_tool_result")]
     WebSearchToolResult {
         tool_use_id: String,
+        #[serde(default)]
         content: serde_json::Value,
     },
+}
+
+fn default_empty_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 fn default_base64_type() -> String {
@@ -249,7 +273,7 @@ pub struct ClaudeResponse {
 }
 
 /// Usage
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -257,6 +281,8 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_tool_use: Option<serde_json::Value>,
 }
@@ -326,6 +352,9 @@ pub struct InlineData {
 pub struct GeminiResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<Candidate>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "promptFeedback")]
+    pub prompt_feedback: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "usageMetadata")]
     pub usage_metadata: Option<UsageMetadata>,
@@ -432,4 +461,90 @@ pub struct SearchEntryPoint {
     #[serde(rename = "renderedContent")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rendered_content: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_use_missing_input_deserializes_to_empty_object() {
+        let json_str = r#"{"type": "tool_use", "id": "call_1", "name": "get_time"}"#;
+        let block: ContentBlock = serde_json::from_str(json_str).expect("should deserialize");
+        match block {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
+                assert_eq!(id, "call_1");
+                assert_eq!(name, "get_time");
+                assert_eq!(input, serde_json::json!({}));
+            }
+            _ => panic!("Expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_tool_result_missing_content_deserializes_to_null() {
+        let json_str = r#"{"type": "tool_result", "tool_use_id": "call_1"}"#;
+        let block: ContentBlock = serde_json::from_str(json_str).expect("should deserialize");
+        match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "call_1");
+                assert!(content.is_null());
+            }
+            _ => panic!("Expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_message_content_array_with_omitted_fields_matches_untagged_enum() {
+        let json_str = r#"[
+            {"type": "tool_use", "id": "call_1", "name": "get_time"},
+            {"type": "tool_result", "tool_use_id": "call_1"}
+        ]"#;
+        let content: MessageContent = serde_json::from_str(json_str).expect("should deserialize");
+        match content {
+            MessageContent::Array(blocks) => {
+                assert_eq!(blocks.len(), 2);
+            }
+            _ => panic!("Expected MessageContent::Array"),
+        }
+    }
+
+    #[test]
+    fn test_thinking_config_adaptive_display() {
+        let json_str = r#"{"type": "adaptive", "display": "summarized"}"#;
+        let config: ThinkingConfig = serde_json::from_str(json_str).expect("should deserialize");
+        assert_eq!(config.type_, "adaptive");
+        assert_eq!(config.display.as_deref(), Some("summarized"));
+        assert_eq!(config.budget_tokens, None);
+
+        let serialized = serde_json::to_string(&config).expect("should serialize");
+        assert!(serialized.contains(r#""display":"summarized""#));
+    }
+
+    #[test]
+    fn test_usage_cache_creation() {
+        let json_str = r#"{
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 80,
+                "ephemeral_1h_input_tokens": 0
+            }
+        }"#;
+        let usage: Usage = serde_json::from_str(json_str).expect("should deserialize");
+        assert_eq!(usage.input_tokens, 100);
+        assert_eq!(usage.output_tokens, 50);
+        assert!(usage.cache_creation.is_some());
+        let cc = usage.cache_creation.as_ref().unwrap();
+        assert_eq!(cc["ephemeral_5m_input_tokens"], 80);
+
+        let serialized = serde_json::to_string(&usage).expect("should serialize");
+        assert!(serialized.contains("ephemeral_5m_input_tokens"));
+    }
 }

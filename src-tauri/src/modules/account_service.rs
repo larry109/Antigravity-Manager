@@ -46,32 +46,24 @@ impl AccountService {
         let mut account =
             modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
 
-        // 6. [NEW] 自动获取配额信息（用于刷新时间排序）
-        let email_for_log = account.email.clone();
-        let access_token = token_res.access_token.clone();
-        match modules::quota::fetch_quota(&access_token, &email_for_log, Some(&account.id)).await {
-            Ok((quota_data, new_project_id)) => {
-                account.quota = Some(quota_data);
-                if let Some(pid) = new_project_id {
-                    account.token.project_id = Some(pid);
-                }
-                // 保存更新后的账号信息
-                if let Err(e) = modules::account::save_account(&account) {
+        // 5.1 统一刷新入口：添加新账号时强制执行一次数据面封号探针；
+        // 封号直接落盘并跳过配额，未封号才拉取配额。
+        match modules::account::fetch_quota_with_retry_forced(&mut account).await {
+            Ok(quota) => {
+                if let Err(e) = modules::update_account_quota(&account.id, quota) {
                     modules::logger::log_warn(&format!(
-                        "[Service] Failed to save quota for {}: {}",
-                        email_for_log, e
+                        "[Service] Failed to persist quota for {}: {}",
+                        account.email, e
                     ));
-                } else {
-                    modules::logger::log_info(&format!(
-                        "[Service] Fetched quota for new account: {}",
-                        email_for_log
-                    ));
+                }
+                if let Ok(reloaded) = modules::account::load_account(&account.id) {
+                    account = reloaded;
                 }
             }
             Err(e) => {
                 modules::logger::log_warn(&format!(
-                    "[Service] Failed to fetch quota for {}: {}",
-                    email_for_log, e
+                    "[Service] Unified quota refresh failed for {}: {}",
+                    account.email, e
                 ));
             }
         }
@@ -117,7 +109,7 @@ impl AccountService {
     ) -> Result<String, String> {
         let handle = match &self.integration {
             modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
-            modules::integration::SystemManager::Headless => None,
+            _ => None,
         };
         modules::oauth_server::prepare_oauth_url(handle, oauth_client_key).await
     }
@@ -128,7 +120,7 @@ impl AccountService {
     ) -> Result<Account, String> {
         let handle = match &self.integration {
             modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
-            modules::integration::SystemManager::Headless => None,
+            _ => None,
         };
         let token_res = modules::oauth_server::start_oauth_flow(handle, oauth_client_key).await?;
         self.process_oauth_token(token_res).await
@@ -137,7 +129,7 @@ impl AccountService {
     pub async fn complete_oauth_login(&self) -> Result<Account, String> {
         let handle = match &self.integration {
             modules::integration::SystemManager::Desktop(h) => Some(h.clone()),
-            modules::integration::SystemManager::Headless => None,
+            _ => None,
         };
         let token_res = modules::oauth_server::complete_oauth_flow(handle).await?;
         self.process_oauth_token(token_res).await
@@ -151,11 +143,12 @@ impl AccountService {
         &self,
         code: String,
         state: Option<String>,
-    ) -> Result<(), String> {
-        modules::oauth_server::submit_oauth_code(code, state).await
+    ) -> Result<Account, String> {
+        let token_res = modules::oauth_server::submit_oauth_code(code, state).await?;
+        self.process_oauth_token(token_res).await
     }
 
-    async fn process_oauth_token(
+    pub async fn process_oauth_token(
         &self,
         token_res: modules::oauth::TokenResponse,
     ) -> Result<Account, String> {

@@ -17,9 +17,10 @@ pub const KNOWN_STABLE_CHROME: &str = "132.0.6834.160";
 static VERSION_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").expect("Invalid version regex"));
 
-/// Pre-compiled regex specifically matching version following antigravity (e.g. `antigravity/1.5`, `Antigravity/1.5.0`, `antigravity/4.3.0`)
+/// Pre-compiled regex specifically matching version following antigravity or antigravity/hub (e.g. `antigravity/1.5`, `Antigravity/1.5.0`, `antigravity/4.3.0`, `antigravity/hub/2.32.1`)
 static ANTIGRAVITY_VERSION_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)antigravity[/v\s]+(\d+(?:\.\d+)+)").expect("Invalid antigravity version regex")
+    Regex::new(r"(?i)antigravity(?:/hub)?[/v\s]+(\d+(?:\.\d+)+)")
+        .expect("Invalid antigravity version regex")
 });
 
 /// Parse version from response text using pre-compiled regex
@@ -72,7 +73,9 @@ enum VersionSource {
 /// Helper struct for version info
 struct VersionConfig {
     version: String,
+    #[allow(dead_code)]
     electron: String,
+    #[allow(dead_code)]
     chrome: String,
 }
 
@@ -214,30 +217,35 @@ pub fn get_default_user_agent() -> String {
 /// Global Session ID (generated once per app launch)
 pub static SESSION_ID: LazyLock<String> = LazyLock::new(|| uuid::Uuid::new_v4().to_string());
 
-/// Returns the best version choice between local and remote
-/// Version selection: max(local installation, remote latest, known stable 4.3.0)
-/// This prevents model rejection due to outdated client version headers.
-pub static USER_AGENT: LazyLock<String> = LazyLock::new(|| {
-    let (config, source) = resolve_version_config();
+/// Antigravity 官方语言服务枢纽 (Antigravity Hub) 版本号
+/// 对应官方出站 User-Agent: antigravity/hub/{OFFICIAL_HUB_VERSION}
+/// 2026-11-19 官方实抓版本与 CL（实抓自官方最新客户端，出站平台段与之一致）
+pub const OFFICIAL_HUB_VERSION: &str = "2.33.0";
 
-    tracing::info!(
-        version = %config.version,
-        source = ?source,
-        "User-Agent initialized"
-    );
+/// Antigravity 官方内部代码仓库 (Google Piper Monorepo) 变更集编号 (Changelist Number / CL)
+/// 官方每一个正式版本发布均对应确定的构建提交点，全球正版客户端保持统一，切勿随机变动
+pub const OFFICIAL_HUB_CL: &str = "1023160026";
 
-    let platform_info = match std::env::consts::OS {
-        "macos" => "Macintosh; Intel Mac OS X 10_15_7",
-        "windows" => "Windows NT 10.0; Win64; x64",
-        "linux" => "X11; Linux x86_64",
-        _ => "X11; Linux x86_64",
-    };
+/// Returns the official Antigravity Hub User-Agent matching the upstream egress signature:
+/// format: "antigravity/hub/{OFFICIAL_HUB_VERSION} (aidev_client; os_type={os}; arch={arch}; cl={OFFICIAL_HUB_CL})"
+/// e.g.: "antigravity/hub/2.32.1 (aidev_client; os_type=windows; arch=amd64; cl=1021296516)"
+pub fn build_official_upstream_user_agent() -> String {
+    crate::modules::hub_version::get_current_hub_user_agent()
+}
 
-    format!(
-        "Antigravity/{} ({}) Chrome/{} Electron/{}",
-        config.version, platform_info, config.chrome, config.electron
-    )
-});
+/// Official Antigravity upstream User-Agent
+///
+/// ⚠️ 这是**冷启动快照**：`LazyLock` 首次访问后即固定。
+/// 出站请求请统一使用 [`current_egress_user_agent()`]，以便启动时的远程 Hub 指纹探测能即时生效。
+pub static USER_AGENT: LazyLock<String> = LazyLock::new(build_official_upstream_user_agent);
+
+/// 当前生效的出站 User-Agent（动态读取已解析的 Hub 指纹）
+///
+/// 启动阶段**不做**远程版本跟随（版本与 CL 必须成对人工校准）；
+/// `/releases` 探测只驱动前端启动提示，出站指纹仍以下方的稳态基线为准。
+pub fn current_egress_user_agent() -> String {
+    crate::modules::hub_version::get_current_hub_user_agent()
+}
 
 /// Sanitizes a custom User-Agent string for upstream egress requests.
 ///
@@ -255,6 +263,10 @@ pub fn sanitize_egress_user_agent(custom_ua: &str) -> String {
     let trimmed = custom_ua.trim();
     if trimmed.is_empty() {
         return USER_AGENT.clone();
+    }
+
+    if trimmed.starts_with("antigravity/hub/") {
+        return trimmed.to_string();
     }
 
     if !trimmed.to_ascii_lowercase().contains("antigravity") {
@@ -362,6 +374,16 @@ mod tests {
             "KNOWN_STABLE_VERSION ({}) must be > 4.1.22; please sync with Cargo.toml",
             KNOWN_STABLE_VERSION
         );
+    }
+
+    #[test]
+    fn test_official_hub_version_baseline() {
+        assert!(
+            compare_semver(OFFICIAL_HUB_VERSION, "2.32.0") > std::cmp::Ordering::Equal,
+            "OFFICIAL_HUB_VERSION must be >= 2.33.0 to satisfy upstream Google Hub baseline"
+        );
+        assert_eq!(OFFICIAL_HUB_VERSION, "2.33.0");
+        assert_eq!(OFFICIAL_HUB_CL, "1023160026");
     }
 
     #[test]

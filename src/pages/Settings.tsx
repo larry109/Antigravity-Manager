@@ -1,14 +1,17 @@
-import { useState, useEffect } from 'react';
-import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send } from 'lucide-react';
+import { useState, useEffect, startTransition } from 'react';
+import { Save, Github, User, MessageCircle, ExternalLink, RefreshCw, Heart, Coffee, LayoutDashboard, Users, Network, Activity, BarChart3, Settings as SettingsIcon, Lock, CheckCircle2, Globe, Send, KeyRound, Copy, Check, ShieldAlert } from 'lucide-react';
 import { request as invoke } from '../utils/request';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useConfigStore } from '../stores/useConfigStore';
-import { AppConfig } from '../types/config';
+import { AppConfig, HubFingerprint } from '../types/config';
 import ModalDialog from '../components/common/ModalDialog';
+import HelpTooltip from '../components/common/HelpTooltip';
 import { showToast } from '../components/common/ToastContainer';
+import { copyToClipboard } from '../utils/clipboard';
+import { cn } from '../utils/cn';
 import QuotaProtection from '../components/settings/QuotaProtection';
 import SmartWarmup from '../components/settings/SmartWarmup';
-import PinnedQuotaModels from '../components/settings/PinnedQuotaModels';
+import ClassicAutoSwitch from '../components/settings/ClassicAutoSwitch';
 import { useDebugConsole } from '../stores/useDebugConsole';
 
 import { useTranslation } from 'react-i18next';
@@ -18,6 +21,8 @@ import { emit } from '@tauri-apps/api/event';
 
 import DebugConsole from '../components/debug/DebugConsole';
 import ProxyPoolSettings from '../components/settings/ProxyPoolSettings';
+import { motion } from 'framer-motion';
+import { ZOOM_LEVELS, getStoredZoom, applyZoom } from '../utils/zoom';
 
 function normalizeDataDirDisplay(path: string): string {
     const trimmed = path.trim();
@@ -37,18 +42,27 @@ function normalizeDataDirDisplay(path: string): string {
 }
 
 function Settings() {
-    const { t, i18n } = useTranslation();
+    const { t } = useTranslation();
     const { config, loadConfig, saveConfig, updateLanguage, updateTheme } = useConfigStore();
     const { enable, disable, isEnabled } = useDebugConsole();
     const [activeTab, setActiveTab] = useState<'general' | 'account' | 'proxy' | 'advanced' | 'debug' | 'about'>('general');
-    const [appVersion, setAppVersion] = useState<string>('4.7.10');
+    const [appVersion, setAppVersion] = useState<string>('5.0.4');
     const [formData, setFormData] = useState<AppConfig>({
         language: 'zh',
         theme: 'system',
         auto_refresh: false,
-        refresh_interval: 15,
+        refresh_interval: 10,
+        startup_refresh: true,
+        refresh_concurrency: 5,
+        refresh_slide_delay_secs: 0.2,
         auto_sync: false,
         sync_interval: 5,
+        auto_switch_classic_depleted: false,
+        classic_auto_switch: {
+            enabled: false,
+            threshold_percentage: 0,
+            monitored_models: ['gemini', 'claude']
+        },
         proxy: {
             enabled: false,
             port: 8080,
@@ -83,7 +97,7 @@ function Settings() {
             monitored_models: []
         },
         pinned_quota_models: {
-            models: ['gemini-pro-agent', 'gemini-3-flash-agent', 'gemini-3.1-flash-image', 'claude-opus-4-6-thinking']
+            models: ['gemini-3.1-pro-high', 'gemini-3.8-flash-high', 'gemini-3.1-flash-image', 'claude-opus-4-6-thinking']
         },
         cloudflared: {
             enabled: false,
@@ -92,8 +106,8 @@ function Settings() {
             use_http2: true
         },
         circuit_breaker: {
-            enabled: false,
-            backoff_steps: [30, 60, 120, 300, 600]
+            enabled: true,
+            backoff_steps: [60, 300, 1800, 7200]
         },
         hidden_menu_items: [],  // 菜单显示设置：默认不隐藏任何菜单项
 
@@ -119,6 +133,7 @@ function Settings() {
         currentVersion: string;
         downloadUrl: string;
         source?: string;
+        channel?: 'stable' | 'beta';
     } | null>(null);
 
     // Homebrew Cask state
@@ -127,10 +142,36 @@ function Settings() {
     const [isBrewConfirmOpen, setIsBrewConfirmOpen] = useState(false);
     const [isBrewSuccessOpen, setIsBrewSuccessOpen] = useState(false);
     const [isUpdateConfirmOpen, setIsUpdateConfirmOpen] = useState(false);
+    const [preferNativeUpdate, setPreferNativeUpdate] = useState(false);
 
+    // UI Zoom state
+    const [uiZoom, setUiZoom] = useState<number>(() => getStoredZoom());
+
+    useEffect(() => {
+        const handleZoomChange = (e: Event) => {
+            const customEvent = e as CustomEvent<number>;
+            if (customEvent.detail) {
+                setUiZoom(customEvent.detail);
+            }
+        };
+        window.addEventListener('app-ui-zoom-change', handleZoomChange);
+        return () => {
+            window.removeEventListener('app-ui-zoom-change', handleZoomChange);
+        };
+    }, []);
+
+    // Official Hub fingerprint state
+    const [hubFingerprint, setHubFingerprint] = useState<HubFingerprint | null>(null);
+    const [detectingHub, setDetectingHub] = useState(false);
+    const [copiedHubUa, setCopiedHubUa] = useState(false);
 
     useEffect(() => {
         loadConfig();
+
+        // 获取当前 Hub 客户端指纹
+        invoke<HubFingerprint>('get_hub_fingerprint')
+            .then(fp => setHubFingerprint(fp))
+            .catch(err => console.error('Failed to get hub fingerprint:', err));
 
         // 获取真实数据目录路径
         invoke<string>('get_data_dir_path')
@@ -138,12 +179,13 @@ function Settings() {
             .catch(err => console.error('Failed to get data dir:', err));
 
         // 加载更新设置
-        invoke<{ auto_check: boolean; last_check_time: number; check_interval_hours: number }>('get_update_settings')
+        invoke<{ auto_check: boolean; last_check_time: number; check_interval_hours: number; update_channel?: 'stable' | 'beta' }>('get_update_settings')
             .then(settings => {
                 setFormData(prev => ({
                     ...prev,
                     auto_check_update: settings.auto_check,
-                    update_check_interval: settings.check_interval_hours
+                    update_check_interval: settings.check_interval_hours,
+                    update_channel: settings.update_channel || (appVersion.includes('-') ? 'beta' : 'stable'),
                 }));
             })
             .catch(err => console.error('Failed to load update settings:', err));
@@ -192,12 +234,79 @@ function Settings() {
             await saveConfig(formData);
             showToast(t('common.saved'), 'success');
 
+            // 刷新当前 Hub 指纹状态
+            invoke<HubFingerprint>('get_hub_fingerprint')
+                .then(fp => setHubFingerprint(fp))
+                .catch(() => {});
+
             // 如果修改了代理配置，提示用户需要重启
             if (proxyEnabled && proxyUrl) {
                 showToast(t('proxy.config.upstream_proxy.restart_hint'), 'info');
             }
         } catch (error) {
             showToast(`${t('common.error')}: ${error}`, 'error');
+        }
+    };
+
+    const handleDetectHubFingerprint = async () => {
+        setDetectingHub(true);
+        try {
+            const fp = await invoke<HubFingerprint>('detect_remote_hub_fingerprint', {
+                customVersion: formData.proxy?.hub_version || null,
+                customCl: formData.proxy?.hub_cl || null,
+            });
+            setHubFingerprint(fp);
+
+            if (fp.update_available && fp.latest_remote_version) {
+                showToast(
+                    t('proxy.config.hub.detect_success_newer_available', {
+                        version: fp.version,
+                        cl: fp.cl,
+                        latest: fp.latest_remote_version,
+                        defaultValue: `官方已发布新版 v${fp.latest_remote_version}（当前出站安全沿用 v${fp.version}，更新本地客户端后再次探测可同步最新 CL）`
+                    }),
+                    'info',
+                    7000
+                );
+            } else if (fp.source === 'local') {
+                showToast(
+                    t('proxy.config.hub.detect_success_local', {
+                        version: fp.version,
+                        cl: fp.cl,
+                        defaultValue: `已从本地已安装的官方客户端同步指纹: v${fp.version} (CL: ${fp.cl})`
+                    }),
+                    'success'
+                );
+            } else if (fp.source === 'baseline') {
+                showToast(
+                    t('proxy.config.hub.detect_success_baseline', {
+                        version: fp.version,
+                        cl: fp.cl,
+                        defaultValue: `当前出站指纹已对齐官方稳态基准: v${fp.version} (CL: ${fp.cl})`
+                    }),
+                    'success'
+                );
+            } else {
+                showToast(
+                    t('proxy.config.hub.detect_success', {
+                        version: fp.version,
+                        cl: fp.cl,
+                        defaultValue: `已成功探测并同步官方最新 Hub: v${fp.version} (CL: ${fp.cl})`
+                    }),
+                    'success'
+                );
+            }
+        } catch (err) {
+            console.error('探测 Hub 失败:', err);
+            showToast(
+                t('proxy.config.hub.detect_failed', {
+                    error: String(err),
+                    defaultValue: `探测失败: ${err}`
+                }),
+                'error'
+            );
+        } finally {
+            setDetectingHub(false);
         }
     };
 
@@ -356,7 +465,7 @@ function Settings() {
         }
     };
 
-    const handleCheckUpdate = async () => {
+    const handleCheckUpdate = async (explicitChannel?: 'stable' | 'beta') => {
         setIsCheckingUpdate(true);
         setUpdateInfo(null);
         try {
@@ -366,7 +475,8 @@ function Settings() {
                 current_version: string;
                 download_url: string;
                 source?: string;
-            }>('check_for_updates');
+                channel?: 'stable' | 'beta';
+            }>('check_for_updates', explicitChannel ? { channel: explicitChannel } : undefined);
 
             setUpdateInfo({
                 hasUpdate: result.has_update,
@@ -374,6 +484,7 @@ function Settings() {
                 currentVersion: result.current_version,
                 downloadUrl: result.download_url,
                 source: result.source,
+                channel: result.channel,
             });
 
             if (result.has_update) {
@@ -392,7 +503,10 @@ function Settings() {
 
     const handleConfirmUpdate = async () => {
         setIsUpdateConfirmOpen(false);
-        if (isBrewInstalled) {
+        // If installed via Homebrew, user didn't choose native update, and updating to a stable release, use Homebrew upgrade.
+        // For Beta updates or when user switches to native update, use native auto-updater because Homebrew Cask only tracks stable.
+        const shouldUseBrew = isBrewInstalled && !preferNativeUpdate && updateInfo?.channel !== 'beta';
+        if (shouldUseBrew) {
             handleBrewUpgrade();
             return;
         }
@@ -467,7 +581,12 @@ function Settings() {
     };
 
     return (
-        <div className="h-full w-full overflow-y-auto">
+        <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            className="h-full w-full overflow-y-auto"
+        >
             <div className="p-5 space-y-4 max-w-7xl mx-auto">
                 {/* 顶部工具栏：Tab 导航和保存按钮 */}
                 <div className="flex justify-between items-center">
@@ -478,7 +597,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('general')}
+                            onClick={() => startTransition(() => setActiveTab('general'))}
                         >
                             {t('settings.tabs.general')}
                         </button>
@@ -487,7 +606,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('account')}
+                            onClick={() => startTransition(() => setActiveTab('account'))}
                         >
                             {t('settings.tabs.account')}
                         </button>
@@ -496,7 +615,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('proxy')}
+                            onClick={() => startTransition(() => setActiveTab('proxy'))}
                         >
                             {t('settings.tabs.proxy')}
                         </button>
@@ -505,7 +624,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('advanced')}
+                            onClick={() => startTransition(() => setActiveTab('advanced'))}
                         >
                             {t('settings.tabs.advanced')}
                         </button>
@@ -514,7 +633,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('debug')}
+                            onClick={() => startTransition(() => setActiveTab('debug'))}
                         >
                             {t('settings.tabs.debug')}
                         </button>
@@ -523,7 +642,7 @@ function Settings() {
                                 ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100 shadow-sm'
                                 : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200'
                                 }`}
-                            onClick={() => setActiveTab('about')}
+                            onClick={() => startTransition(() => setActiveTab('about'))}
                         >
                             {t('settings.tabs.about')}
                         </button>
@@ -554,7 +673,6 @@ function Settings() {
                                     onChange={(e) => {
                                         const newLang = e.target.value;
                                         setFormData({ ...formData, language: newLang });
-                                        i18n.changeLanguage(newLang);
                                         updateLanguage(newLang);
                                     }}
                                 >
@@ -568,6 +686,8 @@ function Settings() {
                                     <option value="ko">한국어</option>
                                     <option value="ru">Русский</option>
                                     <option value="ar">العربية</option>
+                                    <option value="es">Español</option>
+                                    <option value="my">Bahasa Melayu</option>
                                 </select>
                             </div>
 
@@ -587,6 +707,35 @@ function Settings() {
                                     <option value="dark">{t('settings.general.theme_dark')}</option>
                                     <option value="system">{t('settings.general.theme_system')}</option>
                                 </select>
+                            </div>
+
+                            {/* 界面与字体缩放 */}
+                            <div>
+                                <div className="flex justify-between items-center mb-2">
+                                    <label className="block text-sm font-medium text-gray-900 dark:text-base-content">
+                                        {t('settings.general.ui_zoom', '界面与字体缩放')}
+                                    </label>
+                                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                                        Cmd / Ctrl + / - / 0
+                                    </span>
+                                </div>
+                                <select
+                                    className="w-full px-4 py-4 border border-gray-200 dark:border-base-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-gray-900 dark:text-base-content bg-gray-50 dark:bg-base-200"
+                                    value={uiZoom}
+                                    onChange={(e) => {
+                                        // applyZoom dispatches 'app-ui-zoom-change', which syncs uiZoom
+                                        applyZoom(Number(e.target.value));
+                                    }}
+                                >
+                                    {ZOOM_LEVELS.map((level) => (
+                                        <option key={level} value={level}>
+                                            {level}%{level === 100 ? ` (${t('settings.general.ui_zoom_default', '默认')})` : ''}{level === 120 ? ` (${t('settings.general.ui_zoom_recommended', '推荐大屏')})` : ''}
+                                        </option>
+                                    ))}
+                                </select>
+                                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                                    {t('settings.general.ui_zoom_desc', '调整软件整体界面和字体大小，支持随时使用快捷键 Cmd/Ctrl + / - / 0 快速缩放')}
+                                </p>
                             </div>
 
                             {/* 开机自动启动 */}
@@ -620,6 +769,37 @@ function Settings() {
                                 <p className="text-sm text-gray-500 dark:text-gray-400 mt-2">{t('settings.general.auto_launch_desc')}</p>
                             </div>
 
+                            {isTauri() && (
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div>
+                                        <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.general.quiet_autostart')}</div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.general.quiet_autostart_desc')}</p>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.quiet_autostart !== false}
+                                            onChange={async (e) => {
+                                                const enabled = e.target.checked;
+                                                const next = { ...formData, quiet_autostart: enabled };
+                                                setFormData(next);
+                                                if (!config) {
+                                                    return;
+                                                }
+                                                try {
+                                                    await saveConfig(next);
+                                                    showToast(enabled ? t('settings.general.quiet_autostart_enabled') : t('settings.general.quiet_autostart_disabled'), 'success');
+                                                } catch (error) {
+                                                    showToast(`${t('common.error')}: ${error}`, 'error');
+                                                }
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                    </label>
+                                </div>
+                            )}
+
                             {/* 自动检查更新 */}
                             <>
                                 <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
@@ -638,7 +818,6 @@ function Settings() {
                                                     await invoke('save_update_settings', {
                                                         settings: {
                                                             auto_check: enabled,
-                                                            last_check_time: 0,
                                                             check_interval_hours: formData.update_check_interval ?? 24
                                                         }
                                                     });
@@ -669,7 +848,6 @@ function Settings() {
                                                     await invoke('save_update_settings', {
                                                         settings: {
                                                             auto_check: formData.auto_check_update ?? true,
-                                                            last_check_time: 0,
                                                             check_interval_hours: formData.update_check_interval ?? 24
                                                         }
                                                     });
@@ -683,6 +861,132 @@ function Settings() {
                                     </div>
                                 )}
 
+                                {/* 更新通道选择 */}
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div>
+                                        <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.about.update_channel')}</div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                            {formData.update_channel === 'beta'
+                                                ? t('settings.about.channel_beta_hint')
+                                                : t('settings.about.channel_stable_desc', { defaultValue: '稳定版本，推荐日常生产使用' })}
+                                        </p>
+                                    </div>
+                                    <div className="inline-flex p-1 bg-gray-200/80 dark:bg-base-300 rounded-xl border border-gray-300/60 dark:border-base-100">
+                                        <button
+                                            type="button"
+                                            onClick={async () => {
+                                                try {
+                                                    await invoke('save_update_settings', {
+                                                        settings: {
+                                                            update_channel: 'stable',
+                                                        }
+                                                    });
+                                                    setFormData(prev => ({ ...prev, update_channel: 'stable' }));
+                                                    showToast(`${t('settings.about.update_channel')}: ${t('settings.about.channel_stable')}`, 'info');
+                                                    handleCheckUpdate('stable');
+                                                } catch (err) {
+                                                    showToast(`${t('common.error')}: ${err}`, 'error');
+                                                }
+                                            }}
+                                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                                                (formData.update_channel || 'stable') === 'stable'
+                                                    ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm'
+                                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                            }`}
+                                        >
+                                            {t('settings.about.channel_stable')}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={async () => {
+                                                try {
+                                                    await invoke('save_update_settings', {
+                                                        settings: {
+                                                            update_channel: 'beta',
+                                                        }
+                                                    });
+                                                    setFormData(prev => ({ ...prev, update_channel: 'beta' }));
+                                                    showToast(`${t('settings.about.update_channel')}: ${t('settings.about.channel_beta')}`, 'info');
+                                                    handleCheckUpdate('beta');
+                                                } catch (err) {
+                                                    showToast(`${t('common.error')}: ${err}`, 'error');
+                                                }
+                                            }}
+                                            className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
+                                                formData.update_channel === 'beta'
+                                                    ? 'bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm'
+                                                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                            }`}
+                                        >
+                                            <span>{t('settings.about.channel_beta')}</span>
+                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                        </button>
+                                    </div>
+                                </div>
+                            </>
+
+                            {/* 轻量模式 (释放内存) */}
+                            {isTauri() && (
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div>
+                                        <div className="font-medium text-gray-900 dark:text-base-content">{t('settings.general.lightweight_mode')}</div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{t('settings.general.lightweight_mode_desc')}</p>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.lightweight_mode ?? false}
+                                            onChange={(e) => {
+                                                const enabled = e.target.checked;
+                                                setFormData({ ...formData, lightweight_mode: enabled });
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none peer-focus:ring-4 peer-focus:ring-blue-300 dark:peer-focus:ring-blue-800 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500"></div>
+                                    </label>
+                                </div>
+                            )}
+
+                            {/* 托盘左键单击操作 */}
+                            {isTauri() && (
+                                <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-base-200 rounded-lg border border-gray-100 dark:border-base-300">
+                                    <div className="pr-4">
+                                        <div className="font-medium text-gray-900 dark:text-base-content">
+                                            {t('settings.general.tray_click_action')}
+                                        </div>
+                                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                                            {t('settings.general.tray_click_action_desc')}
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center bg-gray-200/80 dark:bg-base-300 p-1 rounded-lg shrink-0">
+                                        <button
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, tray_click_action: 'mini' })}
+                                            className={cn(
+                                                "px-3 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer select-none",
+                                                (formData.tray_click_action || 'mini') === 'mini'
+                                                    ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs font-semibold"
+                                                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                                            )}
+                                        >
+                                            {t('settings.general.tray_click_action_mini_short', 'Mini 悬浮窗')}
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => setFormData({ ...formData, tray_click_action: 'main' })}
+                                            className={cn(
+                                                "px-3 py-1.5 text-xs font-medium rounded-md transition-all cursor-pointer select-none",
+                                                formData.tray_click_action === 'main'
+                                                    ? "bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-xs font-semibold"
+                                                    : "text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white"
+                                            )}
+                                        >
+                                            {t('settings.general.tray_click_action_main_short', '主控制台')}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+
                                 {/* 菜单显示设置 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-6 mt-6">
                                     <h3 className="font-medium text-gray-900 dark:text-base-content mb-3">{t('settings.menu.title')}</h3>
@@ -694,6 +998,7 @@ function Settings() {
                                             { path: '/', label: t('nav.dashboard'), icon: LayoutDashboard },
                                             { path: '/accounts', label: t('nav.accounts'), icon: Users },
                                             { path: '/api-proxy', label: t('nav.proxy'), icon: Network },
+                                            { path: '/apikey-fun', label: t('nav.apikey_fun', '中转站'), icon: KeyRound },
                                             { path: '/monitor', label: t('nav.call_records'), icon: Activity },
                                             { path: '/token-stats', label: t('nav.token_stats'), icon: BarChart3 },
                                             { path: '/user-token', label: t('nav.user_token', 'User Tokens'), icon: Users },
@@ -777,7 +1082,6 @@ function Settings() {
                                         {t('settings.menu.selected_items_note')}
                                     </p>
                                 </div>
-                            </>
                         </div>
                     )}
 
@@ -818,6 +1122,52 @@ function Settings() {
                                     </label>
                                 </div>
 
+                                <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 flex items-center justify-between gap-4 animate-in slide-in-from-top-1 duration-200">
+                                    <div className="min-w-0 flex-1">
+                                        <div className="text-sm font-bold text-gray-900 dark:text-gray-100">{t('settings.account.startup_refresh')}</div>
+                                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{t('settings.account.startup_refresh_desc')}</p>
+                                        {formData.startup_refresh !== false && (
+                                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                <label className="text-[11px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('settings.account.refresh_concurrency')}</label>
+                                                <input
+                                                    type="number"
+                                                    className="w-16 px-2 py-1 bg-gray-50 dark:bg-base-200 border border-gray-100 dark:border-base-300 rounded-md focus:ring-2 focus:ring-blue-500 outline-none text-xs font-bold text-blue-600 dark:text-blue-400"
+                                                    min="1"
+                                                    max="20"
+                                                    value={formData.refresh_concurrency ?? 5}
+                                                    onChange={(e) => {
+                                                        const parsed = parseInt(e.target.value);
+                                                        setFormData({
+                                                            ...formData,
+                                                            refresh_concurrency: Number.isNaN(parsed) ? 5 : Math.min(Math.max(parsed, 1), 20),
+                                                        });
+                                                    }}
+                                                />
+                                                <span className="text-[11px] text-gray-500 dark:text-gray-400">{t('settings.account.refresh_concurrency_hint')}</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.startup_refresh !== false}
+                                            onChange={async (e) => {
+                                                const enabled = e.target.checked;
+                                                const newConfig = { ...formData, startup_refresh: enabled };
+                                                setFormData(newConfig);
+                                                // Hot Save
+                                                try {
+                                                    await saveConfig(newConfig);
+                                                } catch (error) {
+                                                    showToast(`${t('common.error')}: ${error}`, 'error');
+                                                }
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-500 shadow-inner"></div>
+                                    </label>
+                                </div>
+
                                 <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 flex items-center gap-4 animate-in slide-in-from-top-1 duration-200">
                                     <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('settings.account.refresh_interval')}</label>
                                     <div className="relative">
@@ -833,42 +1183,24 @@ function Settings() {
                                 </div>
                             </div>
 
-                            {/* 自动获取当前账号 */}
-                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-emerald-200 transition-all duration-300 shadow-sm">
-                                <div className="flex items-center justify-between">
-                                    <div className="flex items-center gap-4">
-                                        <div className="w-10 h-10 rounded-xl bg-emerald-50 dark:bg-emerald-900/20 flex items-center justify-center text-emerald-500 group-hover:bg-emerald-500 group-hover:text-white transition-all duration-300">
-                                            <User size={20} />
-                                        </div>
-                                        <div>
-                                            <div className="font-bold text-gray-900 dark:text-gray-100">{t('settings.account.auto_sync')}</div>
-                                            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{t('settings.account.auto_sync_desc')}</p>
-                                        </div>
-                                    </div>
-                                    <label className="relative inline-flex items-center cursor-pointer">
-                                        <input
-                                            type="checkbox"
-                                            className="sr-only peer"
-                                            checked={formData.auto_sync}
-                                            onChange={(e) => setFormData({ ...formData, auto_sync: e.target.checked })}
-                                        />
-                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500 shadow-inner"></div>
-                                    </label>
-                                </div>
 
-                                {formData.auto_sync && (
-                                    <div className="mt-5 pt-5 border-t border-gray-50 dark:border-base-300 flex items-center gap-4 animate-in slide-in-from-top-1 duration-200">
-                                        <label className="text-xs font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider">{t('settings.account.sync_interval')}</label>
-                                        <input
-                                            type="number"
-                                            className="w-24 px-3 py-2 bg-gray-50 dark:bg-base-200 border border-gray-100 dark:border-base-300 rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none text-sm font-bold text-emerald-600 dark:text-emerald-400"
-                                            min="1"
-                                            max="35791"
-                                            value={formData.sync_interval}
-                                            onChange={(e) => setFormData({ ...formData, sync_interval: isNaN(parseInt(e.target.value)) ? 1 : Math.min(Math.max(parseInt(e.target.value), 1), 35791) })}
-                                        />
-                                    </div>
-                                )}
+                            {/* 经典款自动热切 */}
+                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-violet-200 transition-all duration-300 shadow-sm">
+                                <ClassicAutoSwitch
+                                    config={formData.classic_auto_switch}
+                                    onChange={async (newConfig) => {
+                                        const newFormData = {
+                                            ...formData,
+                                            classic_auto_switch: newConfig
+                                        };
+                                        setFormData(newFormData);
+                                        try {
+                                            await saveConfig(newFormData);
+                                        } catch (error) {
+                                            showToast(`${t('common.error')}: ${error}`, 'error');
+                                        }
+                                    }}
+                                />
                             </div>
 
                             {/* 7天周配额智能预热 (Smart Warmup) */}
@@ -917,17 +1249,6 @@ function Settings() {
                                             showToast(`${t('common.error')}: ${error}`, 'error');
                                         }
                                     }}
-                                />
-                            </div>
-
-                            {/* 配额关注列表 (Pinned Quota Models) */}
-                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-indigo-200 transition-all duration-300 shadow-sm">
-                                <PinnedQuotaModels
-                                    config={formData.pinned_quota_models}
-                                    onChange={(newConfig) => setFormData({
-                                        ...formData,
-                                        pinned_quota_models: newConfig
-                                    })}
                                 />
                             </div>
                         </div>
@@ -1199,7 +1520,122 @@ function Settings() {
                                     </p>
                                 </div>
 
+                                {/* 官方 Hub 客户端指纹与动态探测 */}
+                                <div className="border-t border-gray-200 dark:border-base-200 pt-4">
+                                    <div className="flex items-center justify-between mb-2">
+                                        <div className="flex items-center gap-2">
+                                            <h3 className="font-medium text-gray-900 dark:text-base-content">
+                                                {t('proxy.config.hub.title', { defaultValue: '官方 Hub 客户端指纹' })}
+                                            </h3>
+                                            <HelpTooltip text={t('proxy.config.hub.tooltip', { defaultValue: '出站流量对齐 Google 官方 Antigravity Hub 原生客户端特征，自动维护版本号与构建 CL 编号以规避 429 配额限制。' })} />
+                                            {hubFingerprint && (
+                                                <span className={cn(
+                                                    "text-xs px-2 py-0.5 rounded-full font-mono font-medium",
+                                                    hubFingerprint.source === 'custom' && "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300",
+                                                    hubFingerprint.source === 'remote' && "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300",
+                                                    hubFingerprint.source === 'local' && "bg-purple-100 text-purple-700 dark:bg-purple-900/40 dark:text-purple-300",
+                                                    hubFingerprint.source === 'baseline' && "bg-gray-100 text-gray-700 dark:bg-base-300 dark:text-gray-300",
+                                                )}>
+                                                    {hubFingerprint.source === 'custom' ? t('proxy.config.hub.source_custom', { defaultValue: '自定义' })
+                                                        : hubFingerprint.source === 'remote' ? t('proxy.config.hub.source_remote', { defaultValue: '远端探测' })
+                                                        : hubFingerprint.source === 'local' ? t('proxy.config.hub.source_local', { defaultValue: '本地应用' })
+                                                        : t('proxy.config.hub.source_baseline', { defaultValue: '稳态基准' })}
+                                                </span>
+                                            )}
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={handleDetectHubFingerprint}
+                                            disabled={detectingHub}
+                                            className="px-3 py-1.5 border border-gray-200 dark:border-base-300 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-base-200 transition-colors text-sm flex items-center gap-1.5"
+                                        >
+                                            <RefreshCw className={cn("w-3.5 h-3.5", detectingHub && "animate-spin")} />
+                                            <span>{t('proxy.config.hub.detect_button', { defaultValue: '动态探测' })}</span>
+                                        </button>
+                                    </div>
 
+                                    {/* 生效的 User-Agent 预览 */}
+                                    <div className="bg-gray-50 dark:bg-base-200 border border-gray-200 dark:border-base-300 rounded-lg p-3 text-xs font-mono text-gray-700 dark:text-gray-300 break-all select-all flex items-center justify-between gap-2 mb-3">
+                                        <span className="truncate">
+                                            {hubFingerprint?.user_agent || 'antigravity/hub/2.23.1 (...) cl=998881661'}
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                if (hubFingerprint?.user_agent) {
+                                                    copyToClipboard(hubFingerprint.user_agent);
+                                                    setCopiedHubUa(true);
+                                                    setTimeout(() => setCopiedHubUa(false), 2000);
+                                                }
+                                            }}
+                                            className="p-1.5 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 rounded transition-colors shrink-0"
+                                            title={t('common.copy')}
+                                        >
+                                            {copiedHubUa ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
+                                        </button>
+                                    </div>
+
+                                    {/* Hub Version & CL 自定义输入框 */}
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                                {t('proxy.config.hub.version_label', { defaultValue: 'Hub 版本号 (Version)' })}
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={formData.proxy?.hub_version || ''}
+                                                onChange={(e) => {
+                                                    const v = e.target.value.trim();
+                                                    setFormData({
+                                                        ...formData,
+                                                        proxy: {
+                                                            ...formData.proxy,
+                                                            hub_version: v || undefined,
+                                                        }
+                                                    });
+                                                }}
+                                                placeholder={hubFingerprint?.version || '2.23.1 (自动)'}
+                                                className="w-full px-3 py-2 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-sm font-mono text-gray-900 dark:text-base-content focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs font-medium text-gray-700 dark:text-gray-300 mb-1">
+                                                {t('proxy.config.hub.cl_label', { defaultValue: 'Piper 构建编号 (CL)' })}
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={formData.proxy?.hub_cl || ''}
+                                                onChange={(e) => {
+                                                    const c = e.target.value.trim();
+                                                    setFormData({
+                                                        ...formData,
+                                                        proxy: {
+                                                            ...formData.proxy,
+                                                            hub_cl: c || undefined,
+                                                        }
+                                                    });
+                                                }}
+                                                placeholder={hubFingerprint?.cl || '998881661 (自动)'}
+                                                className="w-full px-3 py-2 border border-gray-200 dark:border-base-300 rounded-lg bg-gray-50 dark:bg-base-200 text-sm font-mono text-gray-900 dark:text-base-content focus:outline-none focus:ring-2 focus:ring-blue-500"
+                                            />
+                                        </div>
+                                    </div>
+                                    {/* 官方新版本可用提示 Banner */}
+                                    {hubFingerprint?.update_available && hubFingerprint.latest_remote_version && (
+                                        <div className="mt-3 bg-amber-50/60 dark:bg-amber-900/20 border border-amber-200/60 dark:border-amber-800/30 rounded-lg p-2.5 text-xs text-amber-700 dark:text-amber-400 flex items-start gap-2">
+                                            <span className="leading-relaxed">
+                                                {t('proxy.config.hub.banner_newer_available', {
+                                                    latest: hubFingerprint.latest_remote_version,
+                                                    defaultValue: `💡 检测到官方 Hub 已发布新版本 v${hubFingerprint.latest_remote_version}。更新本地官方客户端后点击「动态探测」，可自动提取并同步最新 CL。`
+                                                })}
+                                            </span>
+                                        </div>
+                                    )}
+
+                                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
+                                        {t('proxy.config.hub.tooltip', { defaultValue: '出站流量对齐 Google 官方 Antigravity Hub 原生客户端特征，自动维护版本号与构建 CL 编号以规避 429 配额限制。' })}
+                                    </p>
+                                </div>
 
                                 {/* Antigravity 缓存清理 */}
                                 <div className="border-t border-gray-200 dark:border-base-200 pt-4">
@@ -1459,6 +1895,47 @@ function Settings() {
                                     </div>
                                 )}
                             </div>
+
+                            {/* 遇到限流账号自动进小黑屋 (QoS 降速熔断) 开关 */}
+                            <div className="group bg-white dark:bg-base-100 rounded-xl p-5 border border-gray-100 dark:border-base-200 hover:border-amber-200 transition-all duration-300 shadow-sm relative overflow-hidden">
+                                <div className="absolute top-0 right-0 w-24 h-24 bg-amber-500/5 -mr-12 -mt-12 rounded-full blur-2xl group-hover:bg-amber-500/10 transition-colors"></div>
+                                <div className="flex items-center justify-between relative z-10">
+                                    <div className="flex items-center gap-4">
+                                        <div className="w-10 h-10 rounded-xl bg-amber-50 dark:bg-amber-900/20 flex items-center justify-center text-amber-500 group-hover:bg-amber-500 group-hover:text-white transition-all duration-300 shadow-sm">
+                                            <ShieldAlert size={18} />
+                                        </div>
+                                        <div>
+                                            <div className="font-bold text-gray-900 dark:text-gray-100 text-sm">
+                                                {t('dashboard.qos_auto_jail', '自动小黑屋')} (QoS)
+                                            </div>
+                                            <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 leading-tight max-w-[340px]">
+                                                {t('dashboard.qos_auto_jail_enabled_tip', '开启后遇响应过长的限速账号将自动隔离并解绑会话；关闭时直接忽略校验时长。')}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <label className="relative inline-flex items-center cursor-pointer scale-90">
+                                        <input
+                                            type="checkbox"
+                                            className="sr-only peer"
+                                            checked={formData.proxy?.qos_auto_jail ?? false}
+                                            onChange={(e) => {
+                                                const nextVal = e.target.checked;
+                                                const updated = {
+                                                    ...formData,
+                                                    proxy: {
+                                                        ...formData.proxy,
+                                                        qos_auto_jail: nextVal,
+                                                    },
+                                                };
+                                                setFormData(updated);
+                                                saveConfig({ ...updated, auto_refresh: true })
+                                                    .catch(err => console.error('Save failed:', err));
+                                            }}
+                                        />
+                                        <div className="w-11 h-6 bg-gray-200 dark:bg-base-300 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-amber-500 shadow-inner"></div>
+                                    </label>
+                                </div>
+                            </div>
                         </div>
                     )}
 
@@ -1573,10 +2050,73 @@ function Settings() {
                                     </div>
                                 </div>
 
+                                {/* Update Channel Selector */}
+                                <div className="flex flex-col items-center gap-2">
+                                    <div className="flex items-center gap-2 text-xs font-medium text-gray-500 dark:text-gray-400">
+                                        <span>{t('settings.about.update_channel')}:</span>
+                                        <div className="inline-flex p-1 bg-gray-100 dark:bg-base-300 rounded-xl border border-gray-200/60 dark:border-base-200">
+                                            <button
+                                                type="button"
+                                                onClick={async () => {
+                                                    try {
+                                                        await invoke('save_update_settings', {
+                                                            settings: {
+                                                                update_channel: 'stable',
+                                                            }
+                                                        });
+                                                        setFormData(prev => ({ ...prev, update_channel: 'stable' }));
+                                                        setUpdateInfo(null);
+                                                        showToast(`${t('settings.about.update_channel')}: ${t('settings.about.channel_stable')}`, 'info');
+                                                    } catch (err) {
+                                                        showToast(`${t('common.error')}: ${err}`, 'error');
+                                                    }
+                                                }}
+                                                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                                                    (formData.update_channel || 'stable') === 'stable'
+                                                        ? 'bg-white dark:bg-base-100 text-blue-600 dark:text-blue-400 shadow-sm'
+                                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                                }`}
+                                            >
+                                                {t('settings.about.channel_stable')}
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={async () => {
+                                                    try {
+                                                        await invoke('save_update_settings', {
+                                                            settings: {
+                                                                update_channel: 'beta',
+                                                            }
+                                                        });
+                                                        setFormData(prev => ({ ...prev, update_channel: 'beta' }));
+                                                        showToast(`${t('settings.about.update_channel')}: ${t('settings.about.channel_beta')}`, 'info');
+                                                        handleCheckUpdate('beta');
+                                                    } catch (err) {
+                                                        showToast(`${t('common.error')}: ${err}`, 'error');
+                                                    }
+                                                }}
+                                                className={`px-3 py-1 rounded-lg text-xs font-semibold transition-all flex items-center gap-1 ${
+                                                    formData.update_channel === 'beta'
+                                                        ? 'bg-white dark:bg-base-100 text-amber-600 dark:text-amber-400 shadow-sm'
+                                                        : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                                                }`}
+                                            >
+                                                <span>{t('settings.about.channel_beta')}</span>
+                                                <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                                            </button>
+                                        </div>
+                                    </div>
+                                    {formData.update_channel === 'beta' && (
+                                        <p className="text-[11px] text-amber-600/90 dark:text-amber-400/90">
+                                            {t('settings.about.channel_beta_hint')}
+                                        </p>
+                                    )}
+                                </div>
+
                                 {/* Check for Updates */}
                                 <div className="flex flex-col items-center gap-3">
                                     <button
-                                        onClick={handleCheckUpdate}
+                                        onClick={() => handleCheckUpdate()}
                                         disabled={isCheckingUpdate}
                                         className="px-6 py-2.5 bg-blue-500 hover:bg-blue-600 disabled:bg-gray-300 dark:disabled:bg-gray-700 text-white rounded-lg transition-all flex items-center gap-2 shadow-sm hover:shadow-md disabled:cursor-not-allowed"
                                     >
@@ -1589,11 +2129,16 @@ function Settings() {
                                         <div className="text-center">
                                             {updateInfo.hasUpdate ? (
                                                 <div className="flex flex-col items-center gap-2">
-                                                    <div className="text-sm text-orange-600 dark:text-orange-400 font-medium">
-                                                        {t('settings.about.new_version_available', { version: updateInfo.latestVersion })}
+                                                    <div className="flex items-center gap-1.5 text-sm text-orange-600 dark:text-orange-400 font-medium">
+                                                        <span>{t('settings.about.new_version_available', { version: updateInfo.latestVersion })}</span>
+                                                        {updateInfo.channel === 'beta' && (
+                                                            <span className="px-1.5 py-0.2 text-[10px] font-semibold rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                                                Beta
+                                                            </span>
+                                                        )}
                                                     </div>
                                                     <div className="flex items-center gap-2 flex-wrap justify-center">
-                                                        {isBrewInstalled ? (
+                                                        {isBrewInstalled && !preferNativeUpdate && updateInfo.channel !== 'beta' ? (
                                                             <button
                                                                 onClick={() => setIsBrewConfirmOpen(true)}
                                                                 disabled={isBrewUpgrading}
@@ -1629,6 +2174,24 @@ function Settings() {
                                                             <ExternalLink className="w-3.5 h-3.5" />
                                                         </a>
                                                     </div>
+                                                    {isBrewInstalled && updateInfo.channel !== 'beta' && (
+                                                        <div className="flex items-center justify-center">
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => setPreferNativeUpdate(!preferNativeUpdate)}
+                                                                className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline cursor-pointer"
+                                                            >
+                                                                {preferNativeUpdate ? t('settings.about.brew_switch_to_brew') : t('settings.about.brew_switch_to_native')}
+                                                            </button>
+                                                        </div>
+                                                    )}
+                                                    {isBrewInstalled && updateInfo.channel === 'beta' && (
+                                                        <p className="text-[11px] text-amber-600/90 dark:text-amber-400/90 max-w-md text-center">
+                                                            {t('settings.about.brew_beta_notice', {
+                                                                defaultValue: 'Homebrew 仅支持稳定版更新，检测到测试版更新，已为您切换为原生自动更新。'
+                                                            })}
+                                                        </p>
+                                                    )}
                                                 </div>
                                             ) : (
                                                 <div className="text-sm text-green-600 dark:text-green-400 font-medium">
@@ -1796,7 +2359,14 @@ function Settings() {
                             </div>
                             <div className="flex items-center justify-between">
                                 <span className="text-gray-500">{t('settings.about.latest_version_label', { defaultValue: '最新版本' })}:</span>
-                                <span className="font-bold text-emerald-600 dark:text-emerald-400">{updateInfo?.latestVersion}</span>
+                                <div className="flex items-center gap-1.5">
+                                    <span className="font-bold text-emerald-600 dark:text-emerald-400">{updateInfo?.latestVersion}</span>
+                                    {updateInfo?.channel === 'beta' && (
+                                        <span className="px-1.5 py-0.2 text-[10px] font-semibold rounded bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+                                            Beta
+                                        </span>
+                                    )}
+                                </div>
                             </div>
                             {updateInfo?.source && (
                                 <div className="text-[10px] text-gray-400 text-right pt-1 border-t border-gray-200/50 dark:border-base-300">
@@ -1858,8 +2428,8 @@ function Settings() {
                     </div>
                     <div className="modal-backdrop bg-black/60 backdrop-blur-md fixed inset-0 z-[-1]" onClick={() => setIsSupportModalOpen(false)}></div>
                 </div>
-            </div >
-        </div >
+            </div>
+        </motion.div>
     );
 }
 

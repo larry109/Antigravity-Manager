@@ -1,21 +1,45 @@
+use crate::models::AccountBanInfo;
 use crate::models::QuotaData;
 use crate::modules::config;
+use once_cell::sync::Lazy;
 use rquest;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-// Quota API endpoints (fallback order: Sandbox → Daily → Prod)
-const QUOTA_API_ENDPOINTS: [&str; 3] = [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+/// 配额模块专属端点健康追踪器（独立观察期 60s），
+/// 与主代理网关的 GLOBAL_ENDPOINT_HEALTH 严格解耦，
+/// 坚决杜绝后台配额轮询与 project_id 探针超时污染推理主力端点（Issue #3506, PR #3680）
+static QUOTA_ENDPOINT_HEALTH: Lazy<crate::proxy::upstream::client::EndpointHealthTracker> =
+    Lazy::new(|| {
+        crate::proxy::upstream::client::EndpointHealthTracker::new(std::time::Duration::from_secs(
+            60,
+        ))
+    });
+
+pub fn get_quota_endpoint_health() -> &'static crate::proxy::upstream::client::EndpointHealthTracker
+{
+    &QUOTA_ENDPOINT_HEALTH
+}
+
+// Quota API endpoints (fallback order: Daily → Sandbox)
+//
+// [FIX Issue #3525] Daily 优先，与官方 Antigravity language_server 的出站端点一致。
+// Daily 为官方主力端点；Sandbox 为快速沙箱备用。
+//
+// 配额读数必须来自与推理相同的 host（`V1_INTERNAL_BASE_URL_FALLBACKS`）。
+// Prod (`cloudcode-pa.googleapis.com`) 已在 6a4806e 从推理端点中移除，但它对同一账号
+// 返回的 Gemini 配额与 Daily / Sandbox 不一致（耗尽账号报 100%，可用账号报 0%）。
+// `EndpointHealthTracker` 会把 Prod 当作健康主端点排在 Sandbox 之前，
+// 所以只要 Daily 失败一次，账号页的额度就会在两套数字之间跳变。
+const QUOTA_API_ENDPOINTS: [&str; 2] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-    "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
 ];
 
-// Quota Summary API endpoints (weekly + 5h grouped quota, fallback order 同上)
-const QUOTA_SUMMARY_ENDPOINTS: [&str; 3] = [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+// Quota Summary API endpoints (weekly + 5h grouped quota, fallback order: Daily → Sandbox)
+const QUOTA_SUMMARY_ENDPOINTS: [&str; 2] = [
     "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
-    "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
 ];
 
 /// Critical retry threshold: considered near recovery when quota reaches 95%
@@ -25,44 +49,35 @@ const RETRY_DELAY_SECS: u64 = 30;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct QuotaResponse {
-    models: std::collections::HashMap<String, ModelInfo>,
+    models: std::collections::HashMap<String, crate::models::OfficialModelInfo>,
     #[serde(rename = "deprecatedModelIds")]
     deprecated_model_ids: Option<std::collections::HashMap<String, DeprecatedModelInfo>>,
+    #[serde(rename = "agentModelSorts", default)]
+    agent_model_sorts: Vec<AgentModelSort>,
+    #[serde(rename = "imageGenerationModelIds", default)]
+    image_generation_model_ids: Vec<String>,
+    #[serde(rename = "tieredModelIds", default)]
+    tiered_model_ids: Option<std::collections::HashMap<String, Vec<String>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentModelSort {
+    #[serde(rename = "displayName")]
+    display_name: Option<String>,
+    #[serde(default)]
+    groups: Vec<AgentModelSortGroup>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AgentModelSortGroup {
+    #[serde(rename = "modelIds", default)]
+    model_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct DeprecatedModelInfo {
     #[serde(rename = "newModelId")]
     new_model_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ModelInfo {
-    #[serde(rename = "quotaInfo")]
-    quota_info: Option<QuotaInfo>,
-    #[serde(rename = "displayName")]
-    display_name: Option<String>,
-    #[serde(rename = "supportsImages")]
-    supports_images: Option<bool>,
-    #[serde(rename = "supportsThinking")]
-    supports_thinking: Option<bool>,
-    #[serde(rename = "thinkingBudget")]
-    thinking_budget: Option<i32>,
-    recommended: Option<bool>,
-    #[serde(rename = "maxTokens")]
-    max_tokens: Option<i32>,
-    #[serde(rename = "maxOutputTokens")]
-    max_output_tokens: Option<i32>,
-    #[serde(rename = "supportedMimeTypes")]
-    supported_mime_types: Option<std::collections::HashMap<String, bool>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QuotaInfo {
-    #[serde(rename = "remainingFraction")]
-    remaining_fraction: Option<f64>,
-    #[serde(rename = "resetTime")]
-    reset_time: Option<String>,
 }
 
 // ---- retrieveUserQuotaSummary 响应反序列化结构 ----
@@ -104,6 +119,7 @@ struct LoadProjectResponse {
     paid_tier: Option<Tier>,
     #[serde(rename = "allowedTiers")]
     allowed_tiers: Option<Vec<Tier>>,
+    #[allow(dead_code)]
     #[serde(rename = "ineligibleTiers")]
     ineligible_tiers: Option<Vec<IneligibleTier>>,
 }
@@ -128,6 +144,174 @@ struct Tier {
     slug: Option<String>,
 }
 
+/// 账号状态探测结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanProbeOutcome {
+    /// 数据面推理端点明确返回封禁证据。
+    Banned(AccountBanInfo),
+    /// 数据面推理端点返回 2xx：账号当前未被 TOS 封禁。
+    NotBanned,
+    /// 网络错误 / 429 / 5xx / 非封禁类 403 等，无法判断（绝不能据此解封）。
+    Unknown,
+}
+
+/// 数据面推理端点（权威封禁探针：Daily 主力 + Prod 兜底互备）。
+///
+/// 实测：控制面端点（`loadCodeAssist` / `fetchAvailableModels` /
+/// `retrieveUserQuotaSummary` / `countTokens`）对被 TOS 封禁的账号仍返回 200；
+/// 只有真正的推理入口 `v1internal:generateContent` 会在鉴权层直接返回
+/// `403 PERMISSION_DENIED` + `TOS_VIOLATION`。
+///
+/// 因此封禁探测必须发送一个最小推理请求，且不能复用配额端点或控制面元数据接口。
+const BAN_PROBE_ENDPOINTS: [&str; 2] = [
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent",
+    "https://cloudcode-pa.googleapis.com/v1internal:generateContent",
+];
+
+/// 探针模型：使用官方最新基准轻量级模型 gemini-3.8-flash-low，彻底淘汰 gemini-2.5-flash，
+/// 结合完整的 Antigravity 正式转出请求体（含 systemInstruction 与 thinkingConfig），
+/// 确保与真实客户端出站报文 100% 结构一致，杜绝因报文残缺/模型废弃被上游 WAF 误限流 (429 RESOURCE_EXHAUSTED)。
+const BAN_PROBE_MODEL: &str = "gemini-3.8-flash-low";
+
+/// 纯函数：把一次探针响应归类为封禁 / 未封禁 / 未知。
+///
+/// 只有「403 + 高置信账号级封禁证据」才算封禁；
+/// 2xx 必须包含真实的 Google 模型响应结构（`candidates`），避免代理拦截页或假 200 误解封；
+/// 验证挑战、区域限制、模型级 403、429、5xx 等一律保持 `Unknown`，避免误伤正常账号。
+pub(crate) fn classify_ban_probe_response(status: u16, body: &str) -> BanProbeOutcome {
+    if (200..300).contains(&status) {
+        if body.contains("\"candidates\"") {
+            return BanProbeOutcome::NotBanned;
+        }
+        return BanProbeOutcome::Unknown;
+    }
+    if status != 403 {
+        return BanProbeOutcome::Unknown;
+    }
+
+    let text_lower = body.to_lowercase();
+    // 验证挑战不是账号封禁，交给配额/代理层的验证锁路径处理。
+    // 否则同一份 403 在“配额刷新”和“代理请求”两条路径上会得到不同结论。
+    if text_lower.contains("validation_required")
+        || text_lower.contains("validation_url")
+        || text_lower.contains("verify your account")
+        || text_lower.contains("further action is required")
+    {
+        return BanProbeOutcome::Unknown;
+    }
+    // 区域限制 / 模型级权限拒绝不是 TOS 封禁；`classify_upstream` 只认高置信封禁词，
+    // 这里不需要额外硬编码关键词。
+    match AccountBanInfo::classify_upstream(403, body) {
+        Some(info) => BanProbeOutcome::Banned(info),
+        None => BanProbeOutcome::Unknown,
+    }
+}
+
+/// 探测账号是否被上游封禁。
+///
+/// 发送一个 `maxOutputTokens = 1` 的最小 `generateContent` 请求：
+/// - 2xx ⇒ `NotBanned`（可作为解封权威依据）；
+/// - 403 + TOS 证据 ⇒ `Banned`；
+/// - 其余 ⇒ `Unknown`，必须保持现有封禁状态，绝不能据此解封。
+///
+/// `project_id` 缺失时仍会发请求：封禁账号在鉴权层即被拦截，不影响 403 识别；
+/// 正常账号若因缺少 project 返回 400，会落到 `Unknown`，由后续配额刷新补齐 project 后重试。
+pub async fn probe_account_ban(
+    access_token: &str,
+    project_id: Option<&str>,
+    account_id: Option<&str>,
+    _account_email: Option<&str>,
+) -> BanProbeOutcome {
+    let client = create_standard_client(account_id).await;
+    // 使用官方 wrap_request 生成 100% 完整的 Antigravity 正式出站报文（含 sessionId,
+    // systemInstruction, generationConfig.thinkingConfig, 官方 requestId 与 userAgent），
+    // 彻底解决报文结构不完整被 Google WAF 判定为异常流量导致 429 RESOURCE_EXHAUSTED 的缺陷。
+    let session_id = format!(
+        "ban_probe_{}_{}",
+        chrono::Utc::now().timestamp_millis(),
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+
+    let base_request = json!({
+        "model": BAN_PROBE_MODEL,
+        "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
+        "systemInstruction": {
+            "role": "user",
+            "parts": [{ "text": "You are Antigravity, a helpful assistant." }]
+        },
+        "generationConfig": {
+            "maxOutputTokens": 32000,
+            "thinkingConfig": {
+                "includeThoughts": true,
+                "thinkingLevel": "LOW"
+            }
+        },
+        "session_id": session_id
+    });
+
+    let payload = crate::proxy::mappers::gemini::wrapper::wrap_request(
+        &base_request,
+        project_id.unwrap_or(""),
+        BAN_PROBE_MODEL,
+        account_id,
+        Some(&session_id),
+        None,
+    );
+
+    let mut last_outcome = BanProbeOutcome::Unknown;
+
+    for ep_url in BAN_PROBE_ENDPOINTS {
+        let response = client
+            .post(ep_url)
+            .timeout(std::time::Duration::from_secs(15))
+            .bearer_auth(access_token)
+            .header(
+                rquest::header::USER_AGENT,
+                crate::constants::current_egress_user_agent().as_str(),
+            )
+            // 显式声明 Connection: close，禁止复用 Google 403 封号后被切断的 TCP 连接，
+            // 彻底根除短时连续探测时的 UNEXPECTED_EOF / 假 Unknown 异常
+            .header(rquest::header::CONNECTION, "close")
+            .json(&payload)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let text = response.text().await.unwrap_or_default();
+                let outcome = classify_ban_probe_response(status, &text);
+                tracing::debug!(
+                    account = account_id.unwrap_or("<unknown>"),
+                    endpoint = ep_url,
+                    %status,
+                    outcome = ?outcome,
+                    "Ban probe completed"
+                );
+                // 封禁探针为纯后台健康诊断，绝不写入流量日志，保持监控面板清爽纯净
+                match outcome {
+                    BanProbeOutcome::Banned(_) | BanProbeOutcome::NotBanned => return outcome,
+                    BanProbeOutcome::Unknown => {
+                        last_outcome = outcome;
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    account = account_id.unwrap_or("<unknown>"),
+                    endpoint = ep_url,
+                    error = %e,
+                    "Ban probe endpoint failed, trying next"
+                );
+                continue;
+            }
+        }
+    }
+
+    last_outcome
+}
+
 /// Get shared HTTP Client (15s timeout) for pure info fetching (No JA3)
 async fn create_standard_client(account_id: Option<&str>) -> rquest::Client {
     if let Some(pool) = crate::proxy::proxy_pool::get_global_proxy_pool() {
@@ -147,9 +331,10 @@ async fn create_long_standard_client(account_id: Option<&str>) -> rquest::Client
     }
 }
 
+// 项目 / 档位解析端点（fallback order: Daily → Sandbox → Prod）
 const CLOUD_CODE_LOAD_PROJECT_ENDPOINTS: [&str; 3] = [
-    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
     "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+    "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist",
     "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
 ];
 
@@ -158,13 +343,17 @@ async fn fetch_project_id(
     access_token: &str,
     email: &str,
     account_id: Option<&str>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<String>) {
     let client = create_standard_client(account_id).await;
     let meta = json!({"metadata": {"ideType": "ANTIGRAVITY"}});
+    let health_tracker = get_quota_endpoint_health();
+    let candidate_endpoints =
+        health_tracker.get_ordered_endpoints(&CLOUD_CODE_LOAD_PROJECT_ENDPOINTS);
 
-    for (ep_idx, ep_url) in CLOUD_CODE_LOAD_PROJECT_ENDPOINTS.iter().enumerate() {
+    for (ep_idx, ep_url) in candidate_endpoints.iter().enumerate() {
         let res = client
             .post(*ep_url)
+            .timeout(std::time::Duration::from_secs(15))
             .header(
                 rquest::header::AUTHORIZATION,
                 format!("Bearer {}", access_token),
@@ -172,7 +361,7 @@ async fn fetch_project_id(
             .header(rquest::header::CONTENT_TYPE, "application/json")
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+                crate::constants::current_egress_user_agent().as_str(),
             )
             .json(&meta)
             .send()
@@ -180,7 +369,9 @@ async fn fetch_project_id(
 
         match res {
             Ok(res) => {
-                if res.status().is_success() {
+                let status = res.status();
+                if status.is_success() {
+                    health_tracker.mark_success(ep_url);
                     if let Ok(data) = res.json::<LoadProjectResponse>().await {
                         let project_id = data.project_id.clone();
 
@@ -224,31 +415,36 @@ async fn fetch_project_id(
 
                         if let Some(ref tier) = subscription_tier {
                             crate::modules::logger::log_info(&format!(
-                                "📊 [{}] Subscription identified successfully: {}",
-                                email, tier
+                                "📊 [{}] Subscription identified successfully: {} (raw: {})",
+                                email, tier, raw_tier
                             ));
                         }
 
                         if ep_idx > 0 {
                             crate::modules::logger::log_info(&format!(
-                                "loadCodeAssist fallback succeeded at endpoint #{}",
-                                ep_idx + 1
+                                "loadCodeAssist fallback succeeded at endpoint #{} ({})",
+                                ep_idx + 1,
+                                ep_url
                             ));
                         }
 
-                        return (project_id, subscription_tier);
+                        return (project_id, subscription_tier, Some(raw_tier));
                     }
                 } else {
+                    if crate::proxy::upstream::client::should_try_next_endpoint_for_url(
+                        status, ep_url,
+                    ) {
+                        health_tracker.mark_failure(ep_url);
+                    }
                     crate::modules::logger::log_warn(&format!(
                         "⚠️  [{}] loadCodeAssist failed at {}: Status: {}",
-                        email,
-                        ep_url,
-                        res.status()
+                        email, ep_url, status
                     ));
                     continue;
                 }
             }
             Err(e) => {
+                health_tracker.mark_failure(ep_url);
                 crate::modules::logger::log_error(&format!(
                     "❌ [{}] loadCodeAssist network error at {}: {}",
                     email, ep_url, e
@@ -258,7 +454,19 @@ async fn fetch_project_id(
         }
     }
 
-    (None, None)
+    (None, None, None)
+}
+
+/// 解析账号的 project_id（控制面查询，被封禁账号同样会返回 200）。
+///
+/// 仅用于给数据面封禁探针补齐 project 上下文：探针必须携带真实 project，
+/// 正常账号才能返回 2xx；被封禁账号无论 project 是否存在都会在鉴权层被 403 拦截。
+pub async fn resolve_project_id(
+    access_token: &str,
+    email: &str,
+    account_id: Option<&str>,
+) -> Option<String> {
+    fetch_project_id(access_token, email, account_id).await.0
 }
 
 /// Unified entry point for fetching account quota
@@ -290,16 +498,22 @@ pub async fn fetch_quota_with_cache(
     // 这个「优化」只剩副作用，因此移除。
     //
     // 现在：始终调用；仅在上游返回空值时用缓存/已存值兜底，避免网络抖动把数据抹掉。
-    let (fresh_project_id, fresh_tier) = fetch_project_id(access_token, email, account_id).await;
+    let (fresh_project_id, fresh_tier, fresh_raw_tier) =
+        fetch_project_id(access_token, email, account_id).await;
 
     let project_id = fresh_project_id.or_else(|| cached_project_id.map(|s| s.to_string()));
 
-    let existing_tier = account_id
-        .and_then(|id| crate::modules::load_account(id).ok())
-        .and_then(|acc| acc.quota.and_then(|q| q.subscription_tier));
+    let existing_account = account_id.and_then(|id| crate::modules::load_account(id).ok());
+    let existing_tier = existing_account
+        .as_ref()
+        .and_then(|acc| acc.quota.as_ref().and_then(|q| q.subscription_tier.clone()));
+    let existing_raw_tier = existing_account
+        .as_ref()
+        .and_then(|acc| acc.quota.as_ref().and_then(|q| q.raw_tier.clone()));
 
     // 上游值优先；上游这次没给（网络失败 / 未识别）才保留旧值。
     let subscription_tier = fresh_tier.or(existing_tier);
+    let raw_tier = fresh_raw_tier.or(existing_raw_tier);
 
     // We keep project_id to store in the DB, but we NO LONGER force inject it into payload if it's absent
 
@@ -311,16 +525,19 @@ pub async fn fetch_quota_with_cache(
     };
 
     let mut last_error: Option<AppError> = None;
+    let health_tracker = get_quota_endpoint_health();
+    let candidate_endpoints = health_tracker.get_ordered_endpoints(&QUOTA_API_ENDPOINTS);
 
-    for (ep_idx, ep_url) in QUOTA_API_ENDPOINTS.iter().enumerate() {
-        let has_next = ep_idx + 1 < QUOTA_API_ENDPOINTS.len();
+    for (ep_idx, ep_url) in candidate_endpoints.iter().enumerate() {
+        let has_next = ep_idx + 1 < candidate_endpoints.len();
 
         match client
             .post(*ep_url)
+            .timeout(std::time::Duration::from_secs(15))
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+                crate::constants::current_egress_user_agent().as_str(),
             )
             .json(&payload)
             .send()
@@ -331,19 +548,50 @@ pub async fn fetch_quota_with_cache(
                 if let Err(_) = response.error_for_status_ref() {
                     let status = response.status();
 
+                    if crate::proxy::upstream::client::should_try_next_endpoint_for_url(
+                        status, ep_url,
+                    ) {
+                        health_tracker.mark_failure(ep_url);
+                    }
+
                     // 403 说明该账号本身不可用（未验证 / 被限制）。
-                    //
-                    // 这里曾经有一段「剥离 project 后重试」的逻辑，现已删除：
-                    // 实测上游完全忽略 project 字段，剥离后仍是同一个 403，
-                    // 只会白白多打一次请求、拖慢判定。
                     if status == rquest::StatusCode::FORBIDDEN {
+                        let text = response.text().await.unwrap_or_default();
                         crate::modules::logger::log_warn(&format!(
-                            "Account unauthorized (403 Forbidden), marking as forbidden"
+                            "Account unauthorized (403 Forbidden): {}",
+                            text
                         ));
                         let mut q = QuotaData::new();
                         q.is_forbidden = true;
+                        q.forbidden_reason = Some(text.clone());
                         // 保留本次 loadCodeAssist 拿到的等级；拿不到才回退到已存值
                         q.subscription_tier = subscription_tier.clone();
+                        q.raw_tier = raw_tier.clone();
+
+                        // 智能识别上游返回信息并分类处理
+                        if let Some(id) = account_id {
+                            let text_lower = text.to_lowercase();
+                            let is_validation = text_lower.contains("validation_required")
+                                || text_lower.contains("verify your account")
+                                || text_lower.contains("validation_url");
+
+                            if is_validation {
+                                let block_minutes = 10i64;
+                                let block_until =
+                                    chrono::Utc::now().timestamp() + (block_minutes * 60);
+                                let _ = crate::modules::account::mark_account_validation_blocked(
+                                    id,
+                                    block_until,
+                                    &text,
+                                );
+                            } else {
+                                let _ = crate::modules::account::mark_account_forbidden(
+                                    id,
+                                    &format!("Forbidden (403): {}", text),
+                                );
+                            }
+                        }
+
                         return Ok((q, project_id.clone()));
                     }
 
@@ -369,10 +617,13 @@ pub async fn fetch_quota_with_cache(
                     )));
                 }
 
+                health_tracker.mark_success(ep_url);
+
                 if ep_idx > 0 {
                     crate::modules::logger::log_info(&format!(
-                        "Quota API fallback succeeded at endpoint #{}",
-                        ep_idx + 1
+                        "Quota API fallback succeeded at endpoint #{} ({})",
+                        ep_idx + 1,
+                        ep_url
                     ));
                 }
 
@@ -384,39 +635,37 @@ pub async fn fetch_quota_with_cache(
                 // Use debug level for detailed info to avoid console noise
                 tracing::debug!("Quota API returned {} models", quota_response.models.len());
 
-                for (name, info) in quota_response.models {
-                    if let Some(quota_info) = info.quota_info {
-                        let percentage = quota_info
-                            .remaining_fraction
-                            .map(|f| (f * 100.0) as i32)
-                            .unwrap_or(0);
-
-                        let reset_time = quota_info.reset_time.clone().unwrap_or_default();
-
-                        // Only keep models we care about (exclude internal chat models)
-                        if name.starts_with("gemini")
-                            || name.starts_with("claude")
-                            || name.starts_with("gpt")
-                            || name.starts_with("image")
-                            || name.starts_with("imagen")
-                        {
-                            let model_quota = crate::models::quota::ModelQuota {
-                                name,
-                                percentage,
-                                reset_time,
-                                display_name: info.display_name,
-                                supports_images: info.supports_images,
-                                supports_thinking: info.supports_thinking,
-                                thinking_budget: info.thinking_budget,
-                                recommended: info.recommended,
-                                max_tokens: info.max_tokens,
-                                max_output_tokens: info.max_output_tokens,
-                                supported_mime_types: info.supported_mime_types,
-                            };
-                            quota_data.add_model(model_quota);
+                // 提取该账号在官方 fetchAvailableModels 中真实披露支持的推荐/专用模型集合：
+                // 1. agentModelSorts (Recommended 核心模型列表，如 gemini-4-argon-*, gemini-3.8-flash-*, claude-opus-5-5-*, claude-sonnet-5-5-* 或 claude-*-4-6, gpt-oss-120b-medium)
+                // 2. imageGenerationModelIds (图像生成模型，如 gemini-3.1-flash-image)
+                // 3. tieredModelIds (自适应分层模型，如 gemini-3.8-flash-tiered, gemini-3.5-flash-lite)
+                let mut official_supported_ids = std::collections::HashSet::new();
+                for sort in &quota_response.agent_model_sorts {
+                    for group in &sort.groups {
+                        for id in &group.model_ids {
+                            official_supported_ids.insert(id.trim().to_lowercase());
                         }
                     }
                 }
+                for id in &quota_response.image_generation_model_ids {
+                    official_supported_ids.insert(id.trim().to_lowercase());
+                }
+                if let Some(ref tiered_map) = quota_response.tiered_model_ids {
+                    for ids in tiered_map.values() {
+                        for id in ids {
+                            official_supported_ids.insert(id.trim().to_lowercase());
+                        }
+                    }
+                }
+                // [2026-10-29] 不再向官方可用集合里注入任何“字典存在但未开通”的模型（如 gemini-3.1-flash-lite），
+                // 对外模型列表严格等于 fetchAvailableModels 的可用集合。
+
+                // 使用在线官方推荐结构同步动态目录（替换静态快照推荐列表并刷新模型规格）
+                crate::models::OfficialModelCatalog::sync_live_catalog(
+                    Some(email),
+                    quota_response.models.clone(),
+                    &official_supported_ids,
+                );
 
                 // Parse deprecated model routing rules
                 if let Some(deprecated) = quota_response.deprecated_model_ids {
@@ -432,82 +681,318 @@ pub async fn fetch_quota_with_cache(
                 // （fetchAvailableModels 对免费号和 Pro 号返回完全相同的全量目录）。
                 let final_tier =
                     crate::models::quota::resolve_subscription_tier(subscription_tier.as_deref());
-                quota_data.subscription_tier = Some(final_tier);
+                quota_data.subscription_tier = Some(final_tier.clone());
+                quota_data.raw_tier = raw_tier.clone();
+                let is_ultra = final_tier == "ULTRA";
 
-                // Best-effort: fetch grouped quota summary (weekly + 5h windows).
-                // Failure here must not block the primary quota result.
-                let quota_groups =
+                // Best-effort: 先行获取分组配额摘要 (weekly + 5h windows)。
+                // 这样在解析模型列表时，对于上游不再返回 quotaInfo 的 Gemini/Argon 系模型，
+                // 可以直接提取并绑定其所属分组的真实配额，杜绝模型被误丢弃导致调度器 503 (Issue #3737)。
+                let mut quota_groups =
                     fetch_quota_summary(access_token, email, project_id.as_deref(), account_id)
                         .await;
 
-                // [FIX #3426] Fuse real bucket quotas into models so UI doesn't show fake 100%
-                if let Some(ref groups) = quota_groups {
-                    for model in quota_data.models.iter_mut() {
-                        let name_lower = model.name.to_lowercase();
-                        let is_claude_or_gpt =
-                            name_lower.starts_with("claude") || name_lower.starts_with("gpt");
-                        let is_gemini = name_lower.starts_with("gemini");
+                // Pre-collect any active Gemini 4+ codenames returned by fetchAvailableModels
+                // so future dedicated groups (even with short names like "Helium") are isolated
+                // from general Gemini/3P pools.
+                let mut known_g4_codenames: Vec<String> = Vec::new();
+                for (name, info) in &quota_response.models {
+                    let nl = name.trim().to_lowercase();
+                    if info.is_disabled()
+                        || nl.contains("-disabled")
+                        || nl.ends_with("_disabled")
+                        || nl == "gemini-flash-worker-agy"
+                    {
+                        continue;
+                    }
+                    if let Some(code) =
+                        crate::proxy::common::model_mapping::extract_gemini4_codename(&nl)
+                    {
+                        if !known_g4_codenames.iter().any(|c| c == &code) {
+                            known_g4_codenames.push(code);
+                        }
+                    }
+                }
 
-                        for group in groups {
-                            let gname = group.display_name.to_lowercase();
-                            let matches_group = if is_claude_or_gpt {
-                                gname.contains("claude")
-                                    || gname.contains("gpt")
-                                    || gname.contains("3p")
-                            } else if is_gemini {
-                                gname.contains("gemini")
-                                    || (!gname.contains("claude")
-                                        && !gname.contains("gpt")
-                                        && !gname.contains("3p"))
-                            } else {
-                                false
-                            };
+                // 遍历官方公开模型目录，将模型可用性与额度解析解耦：
+                // 只要模型在官方支持清单且符合旗舰基准线，坚决予以保留，不再因缺少 quotaInfo 而丢弃模型。
+                for (name, info) in quota_response.models {
+                    let name_lower = name.trim().to_lowercase();
 
-                            if matches_group {
-                                // 找到 5h 桶和 weekly 桶，综合计算受限程度最大的实际可用配额
-                                let bucket_5h = group.buckets.iter().find(|b| {
-                                    let win = b.window.to_lowercase();
-                                    let bid = b.bucket_id.to_lowercase();
-                                    win.contains("5h")
-                                        || bid.contains("5h")
-                                        || win.contains("hour")
-                                        || bid.contains("hour")
-                                });
-                                let bucket_weekly = group.buckets.iter().find(|b| {
-                                    let win = b.window.to_lowercase();
-                                    let bid = b.bucket_id.to_lowercase();
-                                    win.contains("week")
-                                        || bid.contains("week")
-                                        || win.contains("7d")
-                                        || bid.contains("7d")
-                                });
+                    // 显式过滤官方明确标记禁用或内部专用的条目（如 disabled: true、-disabled / _disabled、gemini-flash-worker-agy）
+                    if info.is_disabled()
+                        || name_lower.contains("-disabled")
+                        || name_lower.ends_with("_disabled")
+                        || name_lower == "gemini-flash-worker-agy"
+                    {
+                        continue;
+                    }
 
-                                let chosen_bucket = match (bucket_5h, bucket_weekly) {
-                                    (Some(h), Some(w)) => {
-                                        // 若周配额耗尽 (<= 0.001)，模型直接受限于周配额，重置时间使用周重置
-                                        if w.remaining_fraction <= 0.001 {
+                    let in_official_sort = official_supported_ids.is_empty()
+                        || official_supported_ids.contains(&name_lower);
+
+                    // 仅保留当前账号官方实际支持且符合旗舰基准线的模型（彻底剔除 2.5、3.5-flash-low、3-flash-agent、chat_* 等遗留内部条目）
+                    if !in_official_sort
+                        || !crate::proxy::common::model_mapping::is_model_compliant_with_baseline(
+                            &name,
+                        )
+                    {
+                        continue;
+                    }
+
+                    // 1. 提取模型级额度（若上游依然携带 quotaInfo）
+                    let model_pct: Option<i32> = model_quota_percentage(info.quota_info.as_ref());
+                    let model_reset: Option<String> = info
+                        .quota_info
+                        .as_ref()
+                        .and_then(|qi| qi.reset_time.clone())
+                        .filter(|s| !s.is_empty());
+
+                    // 2. 提取分组配额（来自 retrieveUserQuotaSummary 的 5h 与 weekly 双窗口）
+                    let mut group_pct: Option<i32> = None;
+                    let mut group_reset: Option<String> = None;
+
+                    if let Some(ref groups) = quota_groups {
+                        let matched_group = match match_quota_group_for_model_with_codenames(
+                            groups,
+                            &name_lower,
+                            is_ultra,
+                            &known_g4_codenames,
+                        ) {
+                            QuotaGroupMatch::Matched(g) => Some(g),
+                            QuotaGroupMatch::NoGroupKeep => None,
+                            QuotaGroupMatch::SkipUnauthorized => continue,
+                        };
+
+                        if let Some(group) = matched_group {
+                            // ================================================================
+                            // 【临时观测结论 · 2026-11-05】Argon 各档位的配额桶归属
+                            // ================================================================
+                            // 以下结论来自当日对真实账号的直连上游对照实验（非官方文档，
+                            // 通过“发请求 + 前后快照 remainingFraction + 用 tokens/Δ 反推桶容量”得出）：
+                            //
+                            //   argon-high   : 计量走 gemini-5h + gemini-weekly（通用高算力池，
+                            //                  反推容量约 1.04M tokens）；
+                            //                  但**准入前提仍是 argon 桶 > 0** ——
+                            //                  实测 argon=0 时，5h 即使有 78% 余量，三档依旧全部 429。
+                            //   argon-medium : 计量走 gemini-argon-wtu-weekly（反推容量约 1.55M tokens）。
+                            //   argon-low    : 与 medium 共享同一个 argon 周桶（两者余量同步变动）。
+                            //
+                            // 【当下结论】用 argon 桶判定可用性是**对的**（它同时是 high 的准入闸门）。
+                            // 【重要警告】切勿“优化”成按档位绑定不同桶 —— 那会让 argon=0 但 5h 健康的
+                            //   账号被误判为可用，制造假阳性并触发上游 429。
+                            //
+                            // 【关于 quotaInfo 的坑】上游对 argon-high 下发的 quotaInfo 是“多桶最小值”
+                            //   （当时多为 5h 的值），与 argon 桶余量不一致，属展示口径差异，
+                            //   **不可作为准入判据**，也不建议据此修改展示逻辑。
+                            //
+                            // 【为何暂不动调度算法】
+                            //   1. 观测期间上游行为正在变动：同一账号 argon-high 的 quotaInfo 在
+                            //      十几分钟内从“等于 5h”变成“不等于任一边”，说明官方可能正在调整该字段；
+                            //   2. 现有逻辑在“可用性判定”上是自洽的（argon 桶既是准入也是门禁）；
+                            //   3. 上游未做请求前容量预估（实测允许单次请求超额吃穿最后一点余量，
+                            //      归零后下一次才 429），因此网关侧无论怎么建桶映射都无法完全预判；
+                            //   4. 此映射属易变的“上游内部实现细节”，固化它违背本项目
+                            //      “避免脆弱硬编码、优先通用解法”的约定。
+                            //
+                            // 【后人须知】若未来出现“argon 额度充足但 argon-high 持续 429”或
+                            //   “argon 已归零但 high 仍可用”的现象，请**先重新实测**（切勿直接改代码）：
+                            //   a) 直连 daily-cloudcode-pa 发三档各 2~3 次，记录每次前后
+                            //      retrieveUserQuotaSummary 的每个桶 remainingFraction；
+                            //   b) 用 tokens ÷ ΔremainingFraction 反推桶容量，容量相同则同桶；
+                            //   c) 特别验证 argon=0 时 high 是否仍被拒（这一步能确认准入闸门是否还在）；
+                            //   d) 若上游已改变归属，再同步更新本注释与判定逻辑。
+                            // ================================================================
+                            let bucket_5h = group.buckets.iter().find(|b| {
+                                let win = b.window.to_lowercase();
+                                let bid = b.bucket_id.to_lowercase();
+                                win.contains("5h")
+                                    || bid.contains("5h")
+                                    || win.contains("hour")
+                                    || bid.contains("hour")
+                            });
+                            let bucket_weekly = group.buckets.iter().find(|b| {
+                                let win = b.window.to_lowercase();
+                                let bid = b.bucket_id.to_lowercase();
+                                win.contains("week")
+                                    || bid.contains("week")
+                                    || win.contains("7d")
+                                    || bid.contains("7d")
+                            });
+
+                            let chosen_bucket = match (bucket_5h, bucket_weekly) {
+                                (Some(h), Some(w)) => {
+                                    if w.remaining_fraction <= 0.001 {
+                                        Some(w)
+                                    } else if h.remaining_fraction < w.remaining_fraction {
+                                        Some(h)
+                                    } else if w.remaining_fraction < h.remaining_fraction {
+                                        Some(w)
+                                    } else {
+                                        if !w.reset_time.is_empty() {
                                             Some(w)
-                                        } else if h.remaining_fraction <= w.remaining_fraction {
-                                            Some(h)
                                         } else {
-                                            Some(w)
+                                            Some(h)
                                         }
                                     }
-                                    (Some(h), None) => Some(h),
-                                    (None, Some(w)) => Some(w),
-                                    _ => group.buckets.first(),
-                                };
+                                }
+                                (Some(h), None) => Some(h),
+                                (None, Some(w)) => Some(w),
+                                _ => group.buckets.first(),
+                            };
 
-                                if let Some(b) = chosen_bucket {
-                                    model.percentage =
-                                        (b.remaining_fraction * 100.0).round() as i32;
-                                    if !b.reset_time.is_empty() {
-                                        model.reset_time = b.reset_time.clone();
-                                    }
-                                    break;
+                            if let Some(b) = chosen_bucket {
+                                group_pct = Some((b.remaining_fraction * 100.0).round() as i32);
+                                if !b.reset_time.is_empty() {
+                                    group_reset = Some(b.reset_time.clone());
                                 }
                             }
                         }
+                    }
+
+                    // 3. 综合模型级与分组级额度：
+                    // - 若上游不再下发模型级 quotaInfo（如当前 Gemini 系）：自动回退使用分组额度
+                    // - 若两者皆存在：取两者更严格的额度，但模型级显式为 0% 时绝不被正数分组覆盖
+                    // - 若两者皆缺失：保留模型记录（100% 缺省，但不虚构耗尽重置时间），允许调度并由上游做最终鉴权
+                    let (final_percentage, final_reset) = match (model_pct, group_pct) {
+                        (Some(m_p), Some(g_p)) => {
+                            if m_p <= 0 {
+                                (0, model_reset.or(group_reset).unwrap_or_default())
+                            } else {
+                                let p = m_p.min(g_p);
+                                let r = if p == g_p {
+                                    group_reset.or(model_reset)
+                                } else {
+                                    model_reset.or(group_reset)
+                                };
+                                (p, r.unwrap_or_default())
+                            }
+                        }
+                        (Some(m_p), None) => (m_p, model_reset.unwrap_or_default()),
+                        (None, Some(g_p)) => (g_p, group_reset.unwrap_or_default()),
+                        (None, None) => (100, String::new()),
+                    };
+
+                    let model_quota = crate::models::quota::ModelQuota {
+                        name,
+                        percentage: final_percentage,
+                        reset_time: final_reset,
+                        display_name: info.display_name,
+                        supports_images: info.supports_images,
+                        supports_thinking: info.supports_thinking,
+                        thinking_budget: info.thinking_budget.map(|v| v as i32),
+                        recommended: info.recommended,
+                        max_tokens: info.max_tokens.map(|v| v as i32),
+                        max_output_tokens: info.max_output_tokens.map(|v| v as i32),
+                        model: Some(info.model),
+                        supported_mime_types: info.supported_mime_types,
+                    };
+                    quota_data.add_model(model_quota);
+                }
+
+                // [NEW] 若上游下发了 Argon 专属配额组（如 Pro），或当前账号为官方 Ultra 旗舰账号，但 models 中未显式拆分条目时，为该账号注入 Argon 官方权威模型条目
+                if let Some(ref groups) = quota_groups {
+                    let has_argon_group = groups.iter().any(|g| {
+                        let gname = g.display_name.to_lowercase();
+                        gname.contains("argon")
+                            || g.buckets.iter().any(|b| {
+                                let bid = b.bucket_id.to_lowercase();
+                                let bname = b.display_name.as_deref().unwrap_or("").to_lowercase();
+                                bid.contains("argon") || bname.contains("argon")
+                            })
+                    });
+                    if (has_argon_group || is_ultra)
+                        && !quota_data.models.iter().any(|m| {
+                            crate::proxy::common::model_mapping::extract_gemini4_codename(
+                                &m.name.to_lowercase(),
+                            )
+                            .as_deref()
+                                == Some("argon")
+                        })
+                    {
+                        let argon_b = groups
+                            .iter()
+                            .find_map(|g| {
+                                let gname = g.display_name.to_lowercase();
+                                if gname.contains("argon") {
+                                    return g.buckets.first();
+                                }
+                                g.buckets.iter().find(|b| {
+                                    let bid = b.bucket_id.to_lowercase();
+                                    let bname =
+                                        b.display_name.as_deref().unwrap_or("").to_lowercase();
+                                    bid.contains("argon") || bname.contains("argon")
+                                })
+                            })
+                            .or_else(|| {
+                                if is_ultra {
+                                    find_general_gemini_group(groups, &known_g4_codenames)
+                                        .and_then(|g| g.buckets.first())
+                                } else {
+                                    None
+                                }
+                            });
+                        let pct = argon_b
+                            .map(|b| (b.remaining_fraction * 100.0).round() as i32)
+                            .unwrap_or(100);
+                        let reset = argon_b.map(|b| b.reset_time.clone()).unwrap_or_default();
+                        for argon_name in [
+                            "gemini-4-argon",
+                            "gemini-4-argon-high",
+                            "gemini-4-argon-medium",
+                            "gemini-4-argon-low",
+                            "gemini-pro-orchestrator-g1-pro",
+                        ] {
+                            let label = match argon_name {
+                                "gemini-4-argon-high" => "Gemini 4 Argon (High)",
+                                "gemini-4-argon-medium" => "Gemini 4 Argon (Medium)",
+                                "gemini-4-argon-low" => "Gemini 4 Argon (Low)",
+                                "gemini-pro-orchestrator-g1-pro" => "Orchestrator (Argon)",
+                                _ => "Gemini 4 Argon",
+                            };
+                            let placeholder = if argon_name == "gemini-pro-orchestrator-g1-pro" {
+                                "MODEL_PLACEHOLDER_M668"
+                            } else {
+                                "MODEL_PLACEHOLDER_M421"
+                            };
+                            let catalog_max_output =
+                                crate::models::OfficialModelCatalog::get(argon_name)
+                                    .and_then(|info| info.max_output_tokens)
+                                    .filter(|&v| v > 0)
+                                    .map(|v| v as i32)
+                                    .unwrap_or(65536);
+                            quota_data.add_model(crate::models::quota::ModelQuota {
+                                name: argon_name.to_string(),
+                                percentage: pct,
+                                reset_time: reset.clone(),
+                                display_name: Some(label.to_string()),
+                                supports_images: Some(true),
+                                supports_thinking: Some(true),
+                                thinking_budget: Some(-1),
+                                recommended: Some(true),
+                                max_tokens: Some(1048576),
+                                max_output_tokens: Some(catalog_max_output),
+                                model: Some(placeholder.to_string()),
+                                supported_mime_types: None,
+                            });
+                        }
+                    }
+                }
+
+                // [3P ISOLATION] 若账号实际可用模型中没有任何 Claude 或 GPT 模型（如不支持 Opus 5.5 且 4.6/GPT 已下线），
+                // 剔除 upstream 统一返回的虚假 3P 配额分组，防止号池与展示层误判
+                if let Some(ref mut groups) = quota_groups {
+                    let has_claude_or_gpt = quota_data.models.iter().any(|m| {
+                        let n = m.name.to_lowercase();
+                        n.starts_with("claude") || n.starts_with("gpt")
+                    });
+                    if !has_claude_or_gpt {
+                        groups.retain(|g| {
+                            let gname = g.display_name.to_lowercase();
+                            !gname.contains("claude")
+                                && !gname.contains("gpt")
+                                && !gname.contains("3p")
+                        });
                     }
                 }
 
@@ -551,13 +1036,17 @@ async fn fetch_quota_summary(
         json!({})
     };
 
-    for ep_url in QUOTA_SUMMARY_ENDPOINTS.iter() {
+    let health_tracker = get_quota_endpoint_health();
+    let candidate_endpoints = health_tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS);
+
+    for (ep_idx, ep_url) in candidate_endpoints.iter().enumerate() {
         let res = client
             .post(*ep_url)
+            .timeout(std::time::Duration::from_secs(15))
             .bearer_auth(access_token)
             .header(
                 rquest::header::USER_AGENT,
-                crate::constants::NATIVE_OAUTH_USER_AGENT.as_str(),
+                crate::constants::current_egress_user_agent().as_str(),
             )
             .json(&payload)
             .send()
@@ -567,11 +1056,25 @@ async fn fetch_quota_summary(
             Ok(response) => {
                 let status = response.status();
                 if !status.is_success() {
+                    if crate::proxy::upstream::client::should_try_next_endpoint_for_url(
+                        status, ep_url,
+                    ) {
+                        health_tracker.mark_failure(ep_url);
+                    }
                     crate::modules::logger::log_warn(&format!(
                         "QuotaSummary API {} returned {}, trying next endpoint",
                         ep_url, status
                     ));
                     continue;
+                }
+
+                health_tracker.mark_success(ep_url);
+                if ep_idx > 0 {
+                    crate::modules::logger::log_info(&format!(
+                        "QuotaSummary API fallback succeeded at endpoint #{} ({})",
+                        ep_idx + 1,
+                        ep_url
+                    ));
                 }
 
                 let summary: QuotaSummaryResponse = match response.json().await {
@@ -601,7 +1104,6 @@ async fn fetch_quota_summary(
                                     remaining_fraction: b.remaining_fraction?,
                                     reset_time: b.reset_time.unwrap_or_default(),
                                     observed_at: Some(chrono::Utc::now().timestamp_millis()),
-                                    cycle_start: None,
                                     cycle_tokens: None,
                                     display_name: b.display_name,
                                     description: b.description,
@@ -615,6 +1117,7 @@ async fn fetch_quota_summary(
                 return Some(groups);
             }
             Err(e) => {
+                health_tracker.mark_failure(ep_url);
                 crate::modules::logger::log_warn(&format!(
                     "QuotaSummary API request failed at {}: {}",
                     ep_url, e
@@ -675,14 +1178,26 @@ pub async fn get_valid_token_for_warmup(
         }
     }
 
-    // Fetch project_id
-    let (project_id, _) = fetch_project_id(
-        &account.token.access_token,
-        &account.email,
-        Some(&account.id),
-    )
-    .await;
-    let final_pid = project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string());
+    // 探活只需要 project_id，不需要每次重新拉取订阅等级。已有缓存时直接复用，
+    // 避免自动选号遍历多个候选时重复请求 loadCodeAssist。
+    // 注意：fetch_quota_with_cache 仍必须每次调用 loadCodeAssist 作为 tier 权威源。
+    let final_pid = if let Some(pid) = account
+        .token
+        .project_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|pid| !pid.is_empty())
+    {
+        pid.to_string()
+    } else {
+        let (project_id, _, _) = fetch_project_id(
+            &account.token.access_token,
+            &account.email,
+            Some(&account.id),
+        )
+        .await;
+        project_id.unwrap_or_else(|| "bamboo-precept-lgxtn".to_string())
+    };
 
     Ok((account.token.access_token, final_pid))
 }
@@ -694,7 +1209,8 @@ pub async fn warmup_model_directly(
     project_id: &str,
     email: &str,
     percentage: i32,
-    _account_id: Option<&str>,
+    account_id: Option<&str>,
+    probe_intent: bool,
 ) -> bool {
     // Get currently configured proxy port
     let port = config::load_app_config()
@@ -702,12 +1218,16 @@ pub async fn warmup_model_directly(
         .unwrap_or(8045);
 
     let warmup_url = format!("http://127.0.0.1:{}/internal/warmup", port);
-    let body = json!({
+    let mut body = json!({
         "email": email,
         "model": model_name,
         "access_token": access_token,
-        "project_id": project_id
+        "project_id": project_id,
+        "probe_intent": probe_intent
     });
+    if let Some(acc_id) = account_id {
+        body["account_id"] = json!(acc_id);
+    }
 
     // Use a no-proxy client for local loopback requests
     // This prevents Docker environments from routing localhost through external proxies
@@ -734,16 +1254,16 @@ pub async fn warmup_model_directly(
                 true
             } else {
                 let text = response.text().await.unwrap_or_default();
-                crate::modules::logger::log_warn(&format!(
-                    "[Warmup] ✗ {} for {} (was {}%): HTTP {} - {}",
+                crate::modules::logger::log_error(&format!(
+                    "[Warmup] ✗ {} for {} (was {}%): HTTP {} - {} (非服务端故障)",
                     model_name, email, percentage, status, text
                 ));
                 false
             }
         }
         Err(e) => {
-            crate::modules::logger::log_warn(&format!(
-                "[Warmup] ✗ {} for {} (was {}%): {}",
+            crate::modules::logger::log_error(&format!(
+                "[Warmup] ✗ {} for {} (was {}%): {} (网络请求异常，非服务端故障)",
                 model_name, email, percentage, e
             ));
             false
@@ -757,10 +1277,10 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
     loop {
         let all_accounts = crate::modules::account::list_accounts().unwrap_or_default();
-        // [FIX] 过滤掉禁用反代的账号
+        // [FIX] 过滤掉禁用反代 / 已被上游封禁的账号
         let target_accounts: Vec<_> = all_accounts
             .into_iter()
-            .filter(|a| !a.disabled && !a.proxy_disabled)
+            .filter(|a| !a.disabled && !a.proxy_disabled && !a.banned)
             .collect();
 
         if target_accounts.is_empty() {
@@ -801,16 +1321,34 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
             for handle in handles {
                 if let Ok(Some((id, email, token, pid, Some((fresh_quota, _))))) = handle.await {
-                    // [FIX] 预热阶段检测到 403 时，使用统一禁用逻辑，确保账号文件和索引同时更新
+                    // [FIX] 预热阶段检测到 403 时，区分是否属于临时验证并使用统一禁用逻辑
                     if fresh_quota.is_forbidden {
-                        crate::modules::logger::log_warn(&format!(
-                            "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
-                            email
-                        ));
-                        let _ = crate::modules::account::mark_account_forbidden(
-                            &id,
-                            "Warmup: 403 Forbidden - quota fetch denied",
-                        );
+                        let is_validation =
+                            fresh_quota.forbidden_reason.as_deref().map_or(false, |r| {
+                                let lower = r.to_lowercase();
+                                lower.contains("validation_required")
+                                    || lower.contains("verify your account")
+                                    || lower.contains("validation_url")
+                            });
+
+                        if is_validation {
+                            crate::modules::logger::log_warn(&format!(
+                                "[Warmup] Account {} requires validation (VALIDATION_REQUIRED), skipping warmup",
+                                email
+                            ));
+                        } else {
+                            crate::modules::logger::log_warn(&format!(
+                                "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
+                                email
+                            ));
+                            let _ = crate::modules::account::mark_account_forbidden(
+                                &id,
+                                fresh_quota
+                                    .forbidden_reason
+                                    .as_deref()
+                                    .unwrap_or("Warmup: 403 Forbidden - quota fetch denied"),
+                            );
+                        }
                         continue;
                     }
                     let mut account_warmed_series = std::collections::HashSet::new();
@@ -876,45 +1414,58 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 
             tokio::spawn(async move {
                 let mut success = 0;
-                let batch_size = 3;
                 let now_ts = chrono::Utc::now().timestamp();
 
-                for (batch_idx, batch) in warmup_items.chunks(batch_size).enumerate() {
-                    let mut handles = Vec::new();
+                // 按账号组织预热任务：同一账号内的多个模型必须串行执行并保持安全间隔（1.5s），
+                // 彻底杜绝因同 Token 并发涌入触发 Google 上游单会话并发互斥与 Cloud Armor WAF 403 频控拦截；
+                // 不同账号之间并发执行以保障处理效率。
+                let mut account_tasks: std::collections::HashMap<
+                    String,
+                    Vec<(String, String, String, String, String, i32)>,
+                > = std::collections::HashMap::new();
 
-                    for (id, email, model, token, pid, pct) in batch.iter() {
-                        let id = id.clone();
-                        let email = email.clone();
-                        let model = model.clone();
-                        let token = token.clone();
-                        let pid = pid.clone();
-                        let pct = *pct;
+                for item in warmup_items {
+                    account_tasks.entry(item.1.clone()).or_default().push(item);
+                }
 
-                        let handle = tokio::spawn(async move {
-                            let result =
-                                warmup_model_directly(&token, &model, &pid, &email, pct, Some(&id))
-                                    .await;
-                            (result, email, model)
-                        });
-                        handles.push(handle);
-                    }
-
-                    for handle in handles {
-                        match handle.await {
-                            Ok((true, email, model)) => {
-                                success += 1;
+                let mut account_handles = Vec::new();
+                for (_email, items) in account_tasks {
+                    let handle = tokio::spawn(async move {
+                        let mut local_success = 0;
+                        let item_count = items.len();
+                        for (idx, (id, email, model, token, pid, pct)) in
+                            items.into_iter().enumerate()
+                        {
+                            let ok = warmup_model_directly(
+                                &token,
+                                &model,
+                                &pid,
+                                &email,
+                                pct,
+                                Some(&id),
+                                false,
+                            )
+                            .await;
+                            if ok {
+                                local_success += 1;
                                 let history_key = format!("{}:{}:100", email, model);
                                 crate::modules::scheduler::record_warmup_history(
                                     &history_key,
                                     now_ts,
                                 );
                             }
-                            _ => {}
+                            if idx + 1 < item_count {
+                                tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+                            }
                         }
-                    }
+                        local_success
+                    });
+                    account_handles.push(handle);
+                }
 
-                    if batch_idx < (warmup_items.len() + batch_size - 1) / batch_size - 1 {
-                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                for handle in account_handles {
+                    if let Ok(count) = handle.await {
+                        success += count;
                     }
                 }
 
@@ -955,7 +1506,7 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         .cloned()
         .ok_or_else(|| "Account not found".to_string())?;
 
-    if account_owned.disabled || account_owned.proxy_disabled {
+    if account_owned.disabled || account_owned.proxy_disabled || account_owned.banned {
         return Err("Account is disabled".to_string());
     }
 
@@ -966,16 +1517,33 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
             .await
             .map_err(|e| format!("Failed to fetch quota: {}", e))?;
 
-    // [FIX] 预热阶段检测到 403 时，使用统一的 mark_account_forbidden 逻辑，
-    // 确保账号文件和索引文件同时更新，且前端刷新后能感知到禁用状态
+    // [FIX] 预热阶段检测到 403 时，区分是否属于临时验证并使用统一禁用逻辑
     if fresh_quota.is_forbidden {
-        crate::modules::logger::log_warn(&format!(
-            "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
-            email
-        ));
-        let reason = "Warmup: 403 Forbidden - quota fetch denied";
-        let _ = crate::modules::account::mark_account_forbidden(account_id, reason);
-        return Err("Account is forbidden (403)".to_string());
+        let is_validation = fresh_quota.forbidden_reason.as_deref().map_or(false, |r| {
+            let lower = r.to_lowercase();
+            lower.contains("validation_required")
+                || lower.contains("verify your account")
+                || lower.contains("validation_url")
+        });
+
+        if is_validation {
+            crate::modules::logger::log_warn(&format!(
+                "[Warmup] Account {} requires validation (VALIDATION_REQUIRED), skipping warmup",
+                email
+            ));
+            return Err("Account requires validation (VALIDATION_REQUIRED)".to_string());
+        } else {
+            crate::modules::logger::log_warn(&format!(
+                "[Warmup] Account {} returned 403 Forbidden during quota fetch, marking as forbidden",
+                email
+            ));
+            let reason = fresh_quota
+                .forbidden_reason
+                .as_deref()
+                .unwrap_or("Warmup: 403 Forbidden - quota fetch denied");
+            let _ = crate::modules::account::mark_account_forbidden(account_id, reason);
+            return Err("Account is forbidden (403)".to_string());
+        }
     }
 
     let mut models_to_warm = Vec::new();
@@ -1002,8 +1570,16 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
 
     tokio::spawn(async move {
         for (name, pct) in models_to_warm {
-            if warmup_model_directly(&token, &name, &pid, &email, pct, Some(&account_id_clone))
-                .await
+            if warmup_model_directly(
+                &token,
+                &name,
+                &pid,
+                &email,
+                pct,
+                Some(&account_id_clone),
+                true,
+            )
+            .await
             {
                 let history_key = format!("{}:{}:100", email, name);
                 let now_ts = chrono::Utc::now().timestamp();
@@ -1018,4 +1594,462 @@ pub async fn warm_up_account(account_id: &str) -> Result<String, String> {
         "Successfully triggered warmup for {} model series",
         warmed_count
     ))
+}
+
+#[derive(Debug)]
+enum QuotaGroupMatch<'a> {
+    Matched(&'a crate::models::quota::QuotaGroup),
+    NoGroupKeep,
+    SkipUnauthorized,
+}
+
+fn group_matches_codename(group: &crate::models::quota::QuotaGroup, code: &str) -> bool {
+    let gname = group.display_name.to_lowercase();
+    gname.contains(code)
+        || group.buckets.iter().any(|b| {
+            let bid = b.bucket_id.to_lowercase();
+            let bname = b.display_name.as_deref().unwrap_or("").to_lowercase();
+            bid.contains(code) || bname.contains(code)
+        })
+}
+
+fn is_claude_or_3p_group(group: &crate::models::quota::QuotaGroup) -> bool {
+    let gname = group.display_name.to_lowercase();
+    gname.contains("claude") || gname.contains("gpt") || gname.contains("3p")
+}
+
+fn is_dedicated_g4_group(
+    group: &crate::models::quota::QuotaGroup,
+    known_codenames: &[String],
+) -> bool {
+    let gname = group.display_name.to_lowercase();
+    if crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+        &gname,
+        "",
+        known_codenames,
+    )
+    .is_some()
+    {
+        return true;
+    }
+    group.buckets.iter().any(|b| {
+        let bid = b.bucket_id.to_lowercase();
+        let bname = b.display_name.as_deref().unwrap_or("").to_lowercase();
+        crate::proxy::common::model_mapping::extract_group_g4_codename_with_known(
+            &bname,
+            &bid,
+            known_codenames,
+        )
+        .is_some()
+    })
+}
+
+fn find_general_gemini_group<'a>(
+    groups: &'a [crate::models::quota::QuotaGroup],
+    known_codenames: &[String],
+) -> Option<&'a crate::models::quota::QuotaGroup> {
+    groups
+        .iter()
+        .find(|g| {
+            !is_dedicated_g4_group(g, known_codenames)
+                && !is_claude_or_3p_group(g)
+                && (g.display_name.to_lowercase().contains("gemini")
+                    || g.buckets
+                        .iter()
+                        .any(|b| b.bucket_id.to_lowercase().contains("gemini")))
+        })
+        .or_else(|| {
+            groups
+                .iter()
+                .find(|g| !is_dedicated_g4_group(g, known_codenames) && !is_claude_or_3p_group(g))
+        })
+}
+
+/// Extract a Gemini 4+ codename (e.g. "argon", "hydrogen", "carbon") when present.
+fn extract_g4_codename(name_lower: &str) -> Option<String> {
+    crate::proxy::common::model_mapping::extract_gemini4_codename(name_lower)
+}
+
+/// Match a model from `fetchAvailableModels` against `retrieveUserQuotaSummary` groups.
+///
+/// Only legacy `argon` enforces the dedicated-group-or-Ultra gate (#3745). Other Gemini 4+
+/// models (e.g. `hydrogen`, `carbon`, or future codenames) prefer a matching dedicated group
+/// when present and otherwise fall back to the standard Gemini pool across all account tiers.
+fn match_quota_group_for_model_with_codenames<'a>(
+    groups: &'a [crate::models::quota::QuotaGroup],
+    name_lower: &str,
+    is_ultra: bool,
+    known_codenames: &[String],
+) -> QuotaGroupMatch<'a> {
+    let g4_codename = extract_g4_codename(name_lower);
+    let is_argon = g4_codename.as_deref() == Some("argon");
+    let is_claude_or_gpt = g4_codename.is_none()
+        && (name_lower.starts_with("claude") || name_lower.starts_with("gpt"));
+
+    if is_claude_or_gpt {
+        return groups
+            .iter()
+            .find(|g| !is_dedicated_g4_group(g, known_codenames) && is_claude_or_3p_group(g))
+            .map_or(QuotaGroupMatch::NoGroupKeep, QuotaGroupMatch::Matched);
+    }
+
+    if let Some(code) = g4_codename.as_deref() {
+        if let Some(specific) = groups.iter().find(|g| group_matches_codename(g, code)) {
+            return QuotaGroupMatch::Matched(specific);
+        }
+        // Only Argon preserves the strict non-Ultra dedicated-group gate (#3745).
+        if is_argon && !is_ultra {
+            return QuotaGroupMatch::SkipUnauthorized;
+        }
+        return find_general_gemini_group(groups, known_codenames).map_or(
+            if is_argon {
+                QuotaGroupMatch::SkipUnauthorized
+            } else {
+                QuotaGroupMatch::NoGroupKeep
+            },
+            QuotaGroupMatch::Matched,
+        );
+    }
+
+    // Standard Gemini models avoid dedicated G4/3P groups.
+    find_general_gemini_group(groups, known_codenames)
+        .map_or(QuotaGroupMatch::NoGroupKeep, QuotaGroupMatch::Matched)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn match_quota_group_for_model<'a>(
+    groups: &'a [crate::models::quota::QuotaGroup],
+    name_lower: &str,
+    is_ultra: bool,
+) -> QuotaGroupMatch<'a> {
+    match_quota_group_for_model_with_codenames(groups, name_lower, is_ultra, &[])
+}
+
+/// 从 `fetchAvailableModels` 的 `quotaInfo` 推导模型级剩余百分比。
+///
+/// proto3 JSON 会省略值为 0 的字段：已耗尽模型的 `quotaInfo` 只带 `resetTime`、
+/// 不带 `remainingFraction`。这种情况按 0 处理，而不是当作"未知"：否则当
+/// `retrieveUserQuotaSummary` 同时失败时，合并逻辑会落到 `(None, None) => 100`，
+/// 已耗尽的模型显示 100%。
+///
+/// `quotaInfo` 缺失，或既没有 `remainingFraction` 也没有非空 `resetTime` 时，返回 `None`（未知）。
+fn model_quota_percentage(
+    quota_info: Option<&crate::models::official_model::OfficialQuotaInfo>,
+) -> Option<i32> {
+    let qi = quota_info?;
+    match qi.remaining_fraction {
+        Some(fraction) => Some((fraction * 100.0).round() as i32),
+        None if qi.reset_time.as_deref().is_some_and(|s| !s.is_empty()) => Some(0),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_model_info(json: &str) -> crate::models::OfficialModelInfo {
+        serde_json::from_str(json).expect("test fixture must parse as OfficialModelInfo")
+    }
+
+    #[test]
+    fn test_model_quota_percentage_treats_omitted_remaining_fraction_as_exhausted() {
+        // proto3 JSON 省略值为 0 的字段：已耗尽模型的 quotaInfo 只带 resetTime
+        let exhausted = parse_model_info(r#"{"quotaInfo":{"resetTime":"2026-11-23T08:00:00Z"}}"#);
+        assert_eq!(
+            model_quota_percentage(exhausted.quota_info.as_ref()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_model_quota_percentage_keeps_explicit_and_unknown_values() {
+        let cases: [(&str, Option<i32>); 6] = [
+            (
+                r#"{"quotaInfo":{"remainingFraction":0.42,"resetTime":"2026-11-23T08:00:00Z"}}"#,
+                Some(42),
+            ),
+            (r#"{"quotaInfo":{"remainingFraction":1}}"#, Some(100)),
+            (
+                r#"{"quotaInfo":{"remainingFraction":0,"resetTime":"2026-11-23T08:00:00Z"}}"#,
+                Some(0),
+            ),
+            // 既无 remainingFraction 也无 resetTime：无法判断，仍为未知
+            (r#"{"quotaInfo":{}}"#, None),
+            (r#"{"quotaInfo":{"resetTime":""}}"#, None),
+            // 上游不下发 quotaInfo（如部分 Gemini 模型）：回退到分组配额
+            (r#"{}"#, None),
+        ];
+
+        for (json, expected) in cases {
+            let info = parse_model_info(json);
+            assert_eq!(
+                model_quota_percentage(info.quota_info.as_ref()),
+                expected,
+                "quotaInfo fixture: {}",
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn test_quota_and_load_project_endpoints_health_reordering() {
+        let tracker = crate::proxy::upstream::client::EndpointHealthTracker::new(
+            std::time::Duration::from_secs(60),
+        );
+
+        let quota_api_order = vec![
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels",
+        ];
+        let quota_summary_order = vec![
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+            "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
+        ];
+
+        // 默认顺序：loadCodeAssist 为 Daily 优先；配额接口为 Daily -> Sandbox
+        assert_eq!(
+            tracker.get_ordered_endpoints(&CLOUD_CODE_LOAD_PROJECT_ENDPOINTS)[0],
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+        );
+        assert_eq!(
+            tracker.get_ordered_endpoints(&QUOTA_API_ENDPOINTS),
+            quota_api_order
+        );
+        assert_eq!(
+            tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS),
+            quota_summary_order
+        );
+
+        // 标记 Daily 故障（如日常请求中发生超时或连接失败）
+        tracker.mark_failure("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist");
+
+        // loadCodeAssist 仍会跳到健康的主端点 Prod（沙箱备用端点永远排在主端点之后）
+        assert_eq!(
+            tracker.get_ordered_endpoints(&CLOUD_CODE_LOAD_PROJECT_ENDPOINTS)[0],
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"
+        );
+        // 配额接口没有 Prod 可跳：冷却中的 Daily 先探活，Sandbox 兜底，顺序不变
+        assert_eq!(
+            tracker.get_ordered_endpoints(&QUOTA_API_ENDPOINTS),
+            quota_api_order
+        );
+        assert_eq!(
+            tracker.get_ordered_endpoints(&QUOTA_SUMMARY_ENDPOINTS),
+            quota_summary_order
+        );
+    }
+
+    /// 配额读数必须来自推理实际使用的 host。Prod 已在 6a4806e 从推理端点移除，
+    /// 而它报告的 Gemini 配额与 Daily / Sandbox 不一致；两份列表一旦再次分叉，这里会失败。
+    #[test]
+    fn test_quota_endpoints_only_use_inference_hosts() {
+        use crate::proxy::upstream::client::{
+            extract_endpoint_host, V1_INTERNAL_BASE_URL_FALLBACKS,
+        };
+
+        let inference_hosts: Vec<&str> = V1_INTERNAL_BASE_URL_FALLBACKS
+            .iter()
+            .map(|url| extract_endpoint_host(url))
+            .collect();
+
+        let mut graded = 0;
+        for endpoint in QUOTA_API_ENDPOINTS
+            .iter()
+            .chain(QUOTA_SUMMARY_ENDPOINTS.iter())
+        {
+            let host = extract_endpoint_host(endpoint);
+            assert!(
+                inference_hosts.contains(&host),
+                "quota endpoint {} uses host {}, which inference never calls (inference hosts: {:?})",
+                endpoint,
+                host,
+                inference_hosts
+            );
+            graded += 1;
+        }
+
+        assert!(graded > 0, "no quota endpoints were graded");
+        assert_eq!(
+            graded,
+            QUOTA_API_ENDPOINTS.len() + QUOTA_SUMMARY_ENDPOINTS.len()
+        );
+    }
+
+    #[test]
+    fn test_ban_probe_classifies_only_high_confidence_tos_403_as_banned() {
+        let tos = r#"{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service. Please submit an appeal to continue using this product.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudcode-pa.googleapis.com"}]}}"#;
+        match classify_ban_probe_response(403, tos) {
+            BanProbeOutcome::Banned(info) => {
+                assert_eq!(info.code, "TOS_VIOLATION");
+                assert!(info.message.to_lowercase().contains("terms of service"));
+            }
+            other => panic!("expected Banned, got {:?}", other),
+        }
+
+        // 数据面 2xx 且包含 candidates：账号未被 TOS 封禁，可作为解封权威依据。
+        assert_eq!(
+            classify_ban_probe_response(
+                200,
+                r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#
+            ),
+            BanProbeOutcome::NotBanned
+        );
+
+        // 假 200（如代理报错页、空白页等）绝不作为解封依据，必须保持 Unknown。
+        assert_eq!(
+            classify_ban_probe_response(200, "{}"),
+            BanProbeOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ban_probe_response(200, "<html>Proxy Error</html>"),
+            BanProbeOutcome::Unknown
+        );
+
+        // 验证挑战 / 区域限制 / 模型级权限拒绝一律 Unknown，绝不能据此封号或解封。
+        for body in [
+            r#"{"error":{"code":403,"message":"validation_required"}}"#,
+            r#"{"error":{"code":403,"message":"User location is not supported for the API use."}}"#,
+            r#"{"error":{"code":403,"message":"Model not found or not available for this account"}}"#,
+            r#"{"error":{"code":403,"message":"Permission denied for model gemini-3-pro"}}"#,
+        ] {
+            assert_eq!(
+                classify_ban_probe_response(403, body),
+                BanProbeOutcome::Unknown,
+                "403 without high-confidence TOS evidence must stay Unknown: {body}"
+            );
+        }
+        assert_eq!(
+            classify_ban_probe_response(429, "{}"),
+            BanProbeOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ban_probe_response(500, "{}"),
+            BanProbeOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ban_probe_response(400, "{}"),
+            BanProbeOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_ban_probe_does_not_treat_generic_permission_denied_as_ban() {
+        let body = r#"{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}"#;
+        assert_eq!(
+            classify_ban_probe_response(403, body),
+            BanProbeOutcome::Unknown
+        );
+    }
+
+    fn make_test_group(display_name: &str, bucket_id: &str) -> crate::models::quota::QuotaGroup {
+        crate::models::quota::QuotaGroup {
+            display_name: display_name.to_string(),
+            description: None,
+            buckets: vec![crate::models::quota::QuotaBucket {
+                bucket_id: bucket_id.to_string(),
+                window: "5h".to_string(),
+                remaining_fraction: 0.85,
+                reset_time: "2026-11-13T18:00:00Z".to_string(),
+                observed_at: None,
+                cycle_tokens: None,
+                display_name: None,
+                description: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_match_quota_group_preserves_hydrogen_and_carbon_for_non_ultra_without_dedicated_group()
+    {
+        let groups = vec![
+            make_test_group("Gemini", "gemini-5h"),
+            make_test_group("Claude", "3p-5h"),
+        ];
+
+        // Non-Ultra accounts without a dedicated "hydrogen"/"carbon" bucket must fall back
+        // to the standard Gemini pool instead of discarding models returned by fetchAvailableModels.
+        for model in [
+            "gemini-4-hydrogen-high",
+            "gemini-4-hydrogen-low",
+            "gemini-4-carbon-xhigh",
+            "gemini-4-helium-medium",
+        ] {
+            match match_quota_group_for_model(&groups, model, false) {
+                QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Gemini"),
+                other => panic!("expected Gemini fallback for {model}, got {other:?}"),
+            }
+        }
+
+        // Legacy Argon still enforces the dedicated-group-or-Ultra gate (#3745).
+        assert!(matches!(
+            match_quota_group_for_model(&groups, "gemini-4-argon-high", false),
+            QuotaGroupMatch::SkipUnauthorized
+        ));
+        match match_quota_group_for_model(&groups, "gemini-4-argon-high", true) {
+            QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Gemini"),
+            other => panic!("expected Ultra Argon fallback to Gemini, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_quota_group_prefers_dedicated_g4_group_when_present() {
+        let groups = vec![
+            make_test_group("Gemini", "gemini-5h"),
+            make_test_group("Hydrogen", "hydrogen-weekly"),
+            make_test_group("Argon", "argon-weekly"),
+            make_test_group("Claude", "3p-5h"),
+        ];
+
+        match match_quota_group_for_model(&groups, "gemini-4-hydrogen-high", false) {
+            QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Hydrogen"),
+            other => panic!("expected dedicated Hydrogen group, got {other:?}"),
+        }
+        match match_quota_group_for_model(&groups, "gemini-4-argon-high", false) {
+            QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Argon"),
+            other => panic!("expected dedicated Argon group, got {other:?}"),
+        }
+        match match_quota_group_for_model(&groups, "gemini-3.8-flash-high", false) {
+            QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Gemini"),
+            other => panic!("expected standard Gemini group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_match_quota_group_isolates_dynamic_codename_and_ignores_numeric_versions() {
+        // Pure numeric segment after "gemini-4-" must not be treated as a codename.
+        assert_eq!(extract_g4_codename("gemini-4-1-flash"), None);
+        assert_eq!(extract_g4_codename("gemini-4-pro-preview"), None);
+        assert_eq!(
+            extract_g4_codename("gemini-4-helium-xhigh"),
+            Some("helium".to_string())
+        );
+
+        let groups = vec![
+            make_test_group("Helium", "helium-weekly"),
+            make_test_group("Gemini", "gemini-5h"),
+        ];
+        let known_codenames = vec!["helium".to_string()];
+
+        match match_quota_group_for_model_with_codenames(
+            &groups,
+            "gemini-4-helium-xhigh",
+            false,
+            &known_codenames,
+        ) {
+            QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Helium"),
+            other => panic!("expected Helium group, got {other:?}"),
+        }
+
+        // Standard Gemini must skip the dynamic Helium group even when Helium comes first.
+        match match_quota_group_for_model_with_codenames(
+            &groups,
+            "gemini-3.8-flash-high",
+            false,
+            &known_codenames,
+        ) {
+            QuotaGroupMatch::Matched(g) => assert_eq!(g.display_name, "Gemini"),
+            other => panic!("expected Gemini group, got {other:?}"),
+        }
+    }
 }

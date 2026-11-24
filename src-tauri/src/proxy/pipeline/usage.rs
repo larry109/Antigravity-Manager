@@ -108,29 +108,6 @@ impl CanonicalUsage {
             }
         }
 
-        let raw_output = usage
-            .get("total_output_tokens")
-            .or_else(|| usage.get("candidatesTokenCount"))
-            .or_else(|| usage.get("candidates_token_count"))
-            .or_else(|| usage.get("completion_tokens"))
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-
-        let has_new_format = usage.get("total_output_tokens").is_some();
-        let tool_use = usage
-            .get("total_tool_use_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-
-        let output = if has_new_format {
-            raw_output
-                .saturating_add(reasoning)
-                .saturating_add(tool_use)
-        } else {
-            raw_output
-        };
-
         // 计算全量与增量
         // 如果输入数据是 Anthropic 格式（raw_input 存的是 uncached），做加和还原全量
         let (canonical_total_input, uncached_input) = if let Some(cr) = usage
@@ -149,12 +126,55 @@ impl CanonicalUsage {
             (total_input, total_input.saturating_sub(cached))
         };
 
-        let total = usage
+        let raw_output = usage
+            .get("total_output_tokens")
+            .or_else(|| usage.get("candidatesTokenCount"))
+            .or_else(|| usage.get("candidates_token_count"))
+            .or_else(|| usage.get("completion_tokens"))
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let has_new_format = usage.get("total_output_tokens").is_some();
+        let has_separate_thought_field = usage.get("thoughtsTokenCount").is_some()
+            || usage.get("total_thought_tokens").is_some()
+            || usage.get("totalThoughtTokens").is_some();
+
+        let tool_use = usage
+            .get("total_tool_use_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let raw_total = usage
             .get("total_tokens")
             .or_else(|| usage.get("totalTokenCount"))
             .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or_else(|| canonical_total_input.saturating_add(output));
+            .map(|v| v as u32);
+
+        // 权威对齐 OpenAI 规范与 Issue #3951：
+        // total_tokens = prompt_tokens + completion_tokens，
+        // 其中 completion_tokens 必须为全部生成 tokens 的总和（正文 output_tokens + 思考 reasoning_tokens）。
+        // 判断 raw_output 是否已经包含了 reasoning：
+        // 1. 若上游返回了明确的 totalTokenCount，且 <= canonical_total_input + raw_output 且 raw_output >= reasoning，说明 raw_output 已涵盖了思考；
+        // 2. 若无 totalTokenCount，且非新格式、无独立思考分立字段且 raw_output >= reasoning，推断已包含；
+        // 3. 其余情况（如新格式 total_output_tokens、独立 thoughtsTokenCount 或 raw_output < reasoning），说明 raw_output 仅为纯文本，必须补齐加和 reasoning 与 tool_use。
+        let output_already_includes_reasoning = if let Some(tot) = raw_total {
+            tot <= canonical_total_input.saturating_add(raw_output) && raw_output >= reasoning
+        } else {
+            !has_new_format && !has_separate_thought_field && raw_output >= reasoning
+        };
+
+        let output = if output_already_includes_reasoning {
+            raw_output
+        } else {
+            raw_output
+                .saturating_add(reasoning)
+                .saturating_add(tool_use)
+        };
+
+        let total = raw_total
+            .unwrap_or_else(|| canonical_total_input.saturating_add(output))
+            .max(canonical_total_input.saturating_add(output));
 
         Self {
             total_input_tokens: canonical_total_input,
@@ -223,129 +243,6 @@ impl CanonicalUsage {
             "cache_creation_input_tokens": 0,
         })
     }
-
-    /// 散开为 OpenAI Chat 格式：
-    /// OpenAI 规范要求 prompt_tokens 为全量输入（含缓存），缓存单列在 prompt_tokens_details.cached_tokens
-    pub fn to_openai_chat_usage(&self) -> Value {
-        let mut prompt_details = serde_json::Map::new();
-        if self.cached_tokens > 0 {
-            prompt_details.insert("cached_tokens".into(), json!(self.cached_tokens));
-        }
-
-        let mut completion_details = serde_json::Map::new();
-        if self.reasoning_tokens > 0 {
-            completion_details.insert("reasoning_tokens".into(), json!(self.reasoning_tokens));
-        }
-
-        let mut out = json!({
-            "prompt_tokens": self.total_input_tokens,
-            "completion_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens,
-        });
-
-        if let Some(obj) = out.as_object_mut() {
-            if !prompt_details.is_empty() {
-                obj.insert(
-                    "prompt_tokens_details".into(),
-                    Value::Object(prompt_details),
-                );
-            }
-            if !completion_details.is_empty() {
-                obj.insert(
-                    "completion_tokens_details".into(),
-                    Value::Object(completion_details),
-                );
-            }
-        }
-        out
-    }
-
-    /// 散开为 OpenAI Responses 格式
-    pub fn to_openai_responses_usage(&self) -> Value {
-        let mut input_details = serde_json::Map::new();
-        if self.cached_tokens > 0 {
-            input_details.insert("cached_tokens".into(), json!(self.cached_tokens));
-        }
-
-        let mut output_details = serde_json::Map::new();
-        if self.reasoning_tokens > 0 {
-            output_details.insert("reasoning_tokens".into(), json!(self.reasoning_tokens));
-        }
-
-        let mut out = json!({
-            "input_tokens": self.total_input_tokens,
-            "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens,
-        });
-
-        if let Some(obj) = out.as_object_mut() {
-            if !input_details.is_empty() {
-                obj.insert("input_tokens_details".into(), Value::Object(input_details));
-            }
-            if !output_details.is_empty() {
-                obj.insert(
-                    "output_tokens_details".into(),
-                    Value::Object(output_details),
-                );
-            }
-        }
-        out
-    }
-
-    /// 散开为 Gemini Native 原生格式
-    pub fn to_gemini_usage_metadata(&self) -> Value {
-        let mut obj = json!({
-            "promptTokenCount": self.total_input_tokens,
-            "candidatesTokenCount": self.output_tokens,
-            "totalTokenCount": self.total_tokens,
-        });
-        if let Some(map) = obj.as_object_mut() {
-            if self.cached_tokens > 0 {
-                map.insert("cachedContentTokenCount".into(), json!(self.cached_tokens));
-            }
-            if self.reasoning_tokens > 0 {
-                map.insert(
-                    "candidatesTokensDetails".into(),
-                    json!([
-                        {
-                            "modality": "THINKING",
-                            "tokenCount": self.reasoning_tokens
-                        }
-                    ]),
-                );
-            }
-        }
-        obj
-    }
-
-    /// 散开为符合 ProxyMonitor 简要模式与截图参考格式
-    pub fn to_brief_audit_usage(&self) -> Value {
-        let cache_rate = if self.total_input_tokens > 0 {
-            format!(
-                "{:.1}%",
-                (self.cached_tokens as f64 / self.total_input_tokens as f64) * 100.0
-            )
-        } else {
-            "0.0%".to_string()
-        };
-
-        let mut obj = json!({
-            "input_tokens": self.total_input_tokens,
-            "output_tokens": self.output_tokens,
-            "total_tokens": self.total_tokens,
-        });
-
-        if let Some(map) = obj.as_object_mut() {
-            if self.cached_tokens > 0 {
-                map.insert("cached_tokens".into(), json!(self.cached_tokens));
-                map.insert("cache_hit_rate".into(), json!(cache_rate));
-            }
-            if self.reasoning_tokens > 0 {
-                map.insert("reasoning_tokens".into(), json!(self.reasoning_tokens));
-            }
-        }
-        obj
-    }
 }
 
 #[cfg(test)]
@@ -379,30 +276,6 @@ mod tests {
         assert_eq!(claude_val["input_tokens"], 5000);
         assert_eq!(claude_val["output_tokens"], 4100);
         assert_eq!(claude_val["cache_read_input_tokens"], 94000);
-
-        // 验证散开到 OpenAI Chat
-        let chat_val = usage.to_openai_chat_usage();
-        assert_eq!(chat_val["prompt_tokens"], 99000);
-        assert_eq!(chat_val["completion_tokens"], 4100);
-        assert_eq!(chat_val["prompt_tokens_details"]["cached_tokens"], 94000);
-        assert_eq!(
-            chat_val["completion_tokens_details"]["reasoning_tokens"],
-            1000
-        );
-
-        // 验证散开到 OpenAI Responses
-        let resp_val = usage.to_openai_responses_usage();
-        assert_eq!(resp_val["input_tokens"], 99000);
-        assert_eq!(resp_val["output_tokens"], 4100);
-        assert_eq!(resp_val["input_tokens_details"]["cached_tokens"], 94000);
-        assert_eq!(resp_val["output_tokens_details"]["reasoning_tokens"], 1000);
-
-        // 验证散开到简要审计格式
-        let brief = usage.to_brief_audit_usage();
-        assert_eq!(brief["input_tokens"], 99000);
-        assert_eq!(brief["cached_tokens"], 94000);
-        assert_eq!(brief["output_tokens"], 4100);
-        assert_eq!(brief["reasoning_tokens"], 1000);
     }
 
     #[test]
@@ -418,5 +291,40 @@ mod tests {
         assert_eq!(usage.cached_tokens, 94000);
         assert_eq!(usage.uncached_input_tokens, 5000);
         assert_eq!(usage.output_tokens, 110);
+    }
+
+    #[test]
+    fn test_canonical_usage_separate_thoughts_token_count_issue_3951() {
+        // Issue #3951: Google Gemini v1beta / tiered 模型返回单独的 thoughtsTokenCount，
+        // candidatesTokenCount (50) 仅包含文本，未包含思考 (200)，总数 350。
+        // 网关必须将 completion_tokens 纠正为 text + reasoning = 250，
+        // 使得 prompt_tokens (100) + completion_tokens (250) == total_tokens (350)。
+        let gemini_raw = json!({
+            "usageMetadata": {
+                "promptTokenCount": 100,
+                "candidatesTokenCount": 50,
+                "thoughtsTokenCount": 200,
+                "totalTokenCount": 350
+            }
+        });
+
+        let usage = CanonicalUsage::from_gemini(&gemini_raw);
+        assert_eq!(usage.total_input_tokens, 100);
+        assert_eq!(usage.reasoning_tokens, 200);
+        assert_eq!(usage.output_tokens, 250); // 50 text + 200 reasoning
+        assert_eq!(usage.total_tokens, 350); // 100 prompt + 250 completion = 350
+
+        // 验证散开到 OpenAI 格式
+        let openai_usage = crate::proxy::mappers::openai::models::OpenAIUsage::from(&usage);
+        assert_eq!(openai_usage.prompt_tokens, 100);
+        assert_eq!(openai_usage.completion_tokens, 250);
+        assert_eq!(openai_usage.total_tokens, 350);
+        assert_eq!(
+            openai_usage
+                .completion_tokens_details
+                .unwrap()
+                .reasoning_tokens,
+            Some(200)
+        );
     }
 }

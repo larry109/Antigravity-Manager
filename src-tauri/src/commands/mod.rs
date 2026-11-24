@@ -29,14 +29,49 @@ pub async fn list_accounts(
         .await
         .unwrap_or_else(|_| Err("Task panicked".to_string()))?;
 
-    // [FIX] Blend in-memory TokenManager rate limit status into the UI quota display
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
+    // [FIX #3726] 冷启动零等待：优先以 try_read 非阻塞获取 TokenManager 运行时状态
+    // 若服务启动初期持有写锁，绝不阻塞 list_accounts 磁盘列表向前端的毫秒级直出
+    let token_manager = {
+        if let Ok(instance_lock) = proxy_state.instance.try_read() {
+            if let Some(instance) = instance_lock.as_ref() {
+                Some(instance.token_manager.clone())
+            } else if let Ok(admin_lock) = proxy_state.admin_server.try_read() {
+                admin_lock
+                    .as_ref()
+                    .map(|a| a.axum_server.token_manager.clone())
+            } else {
+                None
+            }
+        } else if let Ok(admin_lock) = proxy_state.admin_server.try_read() {
+            admin_lock
+                .as_ref()
+                .map(|a| a.axum_server.token_manager.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(tm) = token_manager {
         for account in &mut accounts {
-            if let Some(reset_secs) = instance
-                .token_manager
-                .get_rate_limit_reset_seconds(&account.id)
-            {
+            let qos_state = tm.qos_guardian.get_state(&account.id);
+            account.qos_status = match qos_state {
+                crate::proxy::qos_guardian::AccountQoSState::Suspicious { .. } => {
+                    Some("suspicious".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Jailed { .. } => {
+                    Some("jailed".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Probing { .. } => {
+                    Some("probing".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::HalfOpen { .. } => {
+                    Some("half_open".to_string())
+                }
+                crate::proxy::qos_guardian::AccountQoSState::Healthy => None,
+            };
+            account.qos_reset_seconds = tm.qos_guardian.get_jailed_remaining_seconds(&account.id);
+
+            if let Some(reset_secs) = tm.get_rate_limit_reset_seconds(&account.id) {
                 if reset_secs > 0 {
                     let reset_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(
                         chrono::Utc::now().timestamp() + reset_secs as i64,
@@ -59,6 +94,55 @@ pub async fn list_accounts(
     Ok(accounts)
 }
 
+/// 手动解除账号的小黑屋限制 (QoS 隔离与冷却)
+#[tauri::command]
+pub async fn release_account_qos_jail(
+    account_id: String,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+) -> Result<(), String> {
+    let token_manager = {
+        if let Ok(instance_lock) = proxy_state.instance.try_read() {
+            if let Some(instance) = instance_lock.as_ref() {
+                Some(instance.token_manager.clone())
+            } else if let Ok(admin_lock) = proxy_state.admin_server.try_read() {
+                admin_lock
+                    .as_ref()
+                    .map(|a| a.axum_server.token_manager.clone())
+            } else {
+                None
+            }
+        } else if let Ok(admin_lock) = proxy_state.admin_server.try_read() {
+            admin_lock
+                .as_ref()
+                .map(|a| a.axum_server.token_manager.clone())
+        } else {
+            None
+        }
+    };
+
+    if let Some(tm) = token_manager {
+        tm.release_account_qos_jail(&account_id);
+    }
+
+    Ok(())
+}
+
+/// 手动解除账号指定模型的 403 冻结
+#[tauri::command]
+pub async fn remove_account_forbidden_model(
+    app: tauri::AppHandle,
+    account_id: String,
+    model: Option<String>,
+) -> Result<bool, String> {
+    let res =
+        crate::modules::account::remove_account_forbidden_model(&account_id, model.as_deref())?;
+    let _ = crate::commands::proxy::reload_proxy_accounts(
+        app.state::<crate::commands::proxy::ProxyServiceState>(),
+    )
+    .await;
+    Ok(res)
+}
+
 /// 添加账号
 #[tauri::command]
 pub async fn add_account(
@@ -70,10 +154,11 @@ pub async fn add_account(
         crate::modules::integration::SystemManager::Desktop(app.clone()),
     );
 
-    let mut account = service.add_account(&refresh_token).await?;
+    let account = service.add_account(&refresh_token).await?;
 
-    // 自动刷新配额
-    let _ = internal_refresh_account_quota(&app, &mut account).await;
+    // 配额刷新（含封号探针）已由 AccountService 内部统一走 fetch_quota_with_retry，
+    // 这里只同步托盘与反代账号池，避免重复探针/重复拉取配额。
+    crate::modules::tray::update_tray_menus(&app);
 
     // 重载账号池
     let _ = crate::commands::proxy::reload_proxy_accounts(
@@ -82,6 +167,23 @@ pub async fn add_account(
     .await;
 
     Ok(account)
+}
+
+/// [NEW #3726] 批量异步高性能导入账号
+#[tauri::command]
+pub async fn batch_import_accounts(
+    app: tauri::AppHandle,
+    entries: Vec<crate::models::ImportAccountEntry>,
+) -> Result<crate::models::BatchImportResult, String> {
+    let result = crate::modules::account::batch_import_accounts_logic(Some(&app), entries).await?;
+
+    // 批量导入完成后，单次重载代理池
+    let _ = crate::commands::proxy::reload_proxy_accounts(
+        app.state::<crate::commands::proxy::ProxyServiceState>(),
+    )
+    .await;
+
+    Ok(result)
 }
 
 /// 删除账号
@@ -192,6 +294,14 @@ pub async fn get_current_account() -> Result<Option<Account>, String> {
     }
 }
 
+/// 获取经典款、Antigravity IDE、Antigravity CLI 三大客户端独立生效的当前账号状态
+#[tauri::command]
+pub async fn get_active_clients_status() -> Result<crate::models::ActiveClientsStatus, String> {
+    tokio::task::spawn_blocking(modules::account::detect_active_clients_status)
+        .await
+        .unwrap_or_else(|_| Err("Task panicked".to_string()))
+}
+
 /// 导出账号（包含 refresh_token）
 use crate::models::AccountExportResponse;
 
@@ -236,8 +346,8 @@ pub async fn fetch_account_quota(
     let mut account =
         modules::load_account(&account_id).map_err(crate::error::AppError::Account)?;
 
-    // 使用带重试的查询 (Shared logic)
-    let mut quota = modules::account::fetch_quota_with_retry(&mut account).await?;
+    // 单账号手动刷新（显式用户意图）：强制执行最新封禁探针
+    let mut quota = modules::account::fetch_quota_with_retry_forced(&mut account).await?;
 
     // 4. 更新账号配额
     modules::update_account_quota(&account_id, quota.clone())
@@ -247,19 +357,15 @@ pub async fn fetch_account_quota(
 
     crate::modules::tray::update_tray_menus(&app);
 
-    // 5. 同步到运行中的反代服务（如果已启动）
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
+    // 5. 同步到运行中的反代服务（如果已启动，覆盖 instance 与 admin_server）
+    for tm in proxy_state.active_token_managers().await {
         if quota.models.iter().any(|model| model.percentage > 0) {
-            instance.token_manager.clear_rate_limit_memory(&account_id);
+            tm.clear_rate_limit_memory(&account_id);
         }
-        let _ = instance.token_manager.reload_account(&account_id).await;
+        let _ = tm.reload_account(&account_id).await;
 
         // Blend TokenManager lockout state only for models that are still 0%
-        if let Some(reset_secs) = instance
-            .token_manager
-            .get_rate_limit_reset_seconds(&account_id)
-        {
+        if let Some(reset_secs) = tm.get_rate_limit_reset_seconds(&account_id) {
             if reset_secs > 0 {
                 let reset_iso = chrono::DateTime::<chrono::Utc>::from_timestamp(
                     chrono::Utc::now().timestamp() + reset_secs as i64,
@@ -289,17 +395,26 @@ pub async fn refresh_all_quotas_internal(
 ) -> Result<RefreshStats, String> {
     let stats = modules::account::refresh_all_quotas_logic().await?;
 
-    // 同步到运行中的反代服务（如果已启动）
-    let instance_lock = proxy_state.instance.read().await;
-    if let Some(instance) = instance_lock.as_ref() {
-        let _ = instance.token_manager.reload_all_accounts().await;
+    // 记录刷新完成时间戳，供后台自动刷新调度器对齐周期 (Fixes #3958)
+    modules::auto_refresh::record_refresh_timestamp(chrono::Utc::now().timestamp());
+
+    // 同步到运行中的反代服务（如果已启动，覆盖 instance 与 admin_server）
+    for tm in proxy_state.active_token_managers().await {
+        let _ = tm.reload_all_accounts().await;
     }
 
     // 发送全局刷新事件给 UI (如果需要)
-    if let Some(handle) = app_handle {
+    if let Some(handle) = app_handle.as_ref() {
         use tauri::Emitter;
         let _ = handle.emit("accounts://refreshed", ());
     }
+
+    // 经典款配额耗尽自动热切换检查与执行
+    let _ = crate::modules::auto_switch::check_and_auto_switch_classic(
+        proxy_state,
+        app_handle.as_ref(),
+    )
+    .await;
 
     Ok(stats)
 }
@@ -310,6 +425,12 @@ pub async fn refresh_all_quotas(
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     app_handle: tauri::AppHandle,
 ) -> Result<RefreshStats, String> {
+    let _guard = match modules::auto_refresh::try_acquire_refresh_lock() {
+        Some(guard) => guard,
+        None => {
+            return Err("A quota refresh task is already in progress, please wait.".to_string());
+        }
+    };
     refresh_all_quotas_internal(&proxy_state, Some(app_handle)).await
 }
 /// 获取设备指纹（当前 storage.json + 账号绑定）
@@ -423,29 +544,56 @@ pub async fn save_config(
 
     modules::save_app_config(&config)?;
 
-    // 通知托盘配置已更新
+    crate::modules::logger::set_internal_error_log_budget_bytes(
+        config.proxy.internal_error_log_retention.budget_bytes(),
+    );
+    if let Err(e) =
+        tokio::task::spawn_blocking(crate::modules::logger::apply_internal_error_log_retention)
+            .await
+            .map_err(|e| e.to_string())?
+    {
+        tracing::warn!("Failed to apply internal error log retention: {}", e);
+    }
+
+    // 通知所有窗口配置已更新，并跨窗口广播主题与语言变更
     let _ = app.emit("config://updated", ());
+    let _ = app.emit(
+        "app://theme-changed",
+        serde_json::json!({ "theme": config.theme.clone() }),
+    );
+    let _ = app.emit(
+        "app://language-changed",
+        serde_json::json!({ "language": config.language.clone() }),
+    );
 
     // 同步全局内存配置（无论反代服务当前是否处于运行状态）
+    crate::modules::hub_version::update_hub_fingerprint(
+        config.proxy.hub_version.as_deref(),
+        config.proxy.hub_cl.as_deref(),
+    );
     crate::proxy::update_thinking_budget_config(config.proxy.thinking_budget.clone());
     crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
+    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::update_prompt_rewrite_config(
+        &config.proxy.prompt_rewrite,
+    );
     crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
-    crate::proxy::config::update_global_compression_level(
-        config.proxy.experimental.compression_level.clone(),
-        config.proxy.experimental.enable_usage_scaling,
-    );
-    crate::proxy::config::update_global_thresholds(
-        config.proxy.experimental.context_compression_threshold_l1,
-        config.proxy.experimental.context_compression_threshold_l2,
-        config.proxy.experimental.context_compression_threshold_l3,
-    );
+    crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
+    crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
+    crate::proxy::update_upload_timeout_config(config.proxy.upload_timeouts.clone());
     crate::proxy::config::update_global_audit_config(
         config.proxy.experimental.payload_storage_mode.clone(),
         config.proxy.experimental.log_retention_days,
         config.proxy.experimental.thinking_store_enabled,
         config.proxy.experimental.thinking_retention_days,
         Some(config.proxy.experimental.thinking_max_memory_turns),
+        Some(config.proxy.experimental.enable_global_compaction_strip),
     );
+
+    // 同步健康检查日志捕获开关
+    let monitor_lock = proxy_state.monitor.read().await;
+    if let Some(monitor) = monitor_lock.as_ref() {
+        monitor.set_capture_health_logs(config.proxy.capture_health_logs);
+    }
 
     // 热更新正在运行的服务
     let instance_lock = proxy_state.instance.read().await;
@@ -464,8 +612,6 @@ pub async fn save_config(
             .await;
         // 更新安全策略 (auth)
         instance.axum_server.update_security(&config.proxy).await;
-        // 更新 z.ai 配置
-        instance.axum_server.update_zai(&config.proxy).await;
         // 更新实验性配置
         instance
             .axum_server
@@ -482,36 +628,69 @@ pub async fn save_config(
         crate::proxy::update_thinking_budget_config(config.proxy.thinking_budget.clone());
         // [NEW] 更新全局系统提示词配置
         crate::proxy::update_global_system_prompt_config(config.proxy.global_system_prompt.clone());
+        crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::update_prompt_rewrite_config(
+            &config.proxy.prompt_rewrite,
+        );
         // [NEW] 更新全局图像思维模式配置
         crate::proxy::update_image_thinking_mode(config.proxy.image_thinking_mode.clone());
-        // [NEW] 更新全局压缩等级配置
-        crate::proxy::config::update_global_compression_level(
-            config.proxy.experimental.compression_level.clone(),
-            config.proxy.experimental.enable_usage_scaling,
-        );
+        crate::proxy::update_multimodal_config(config.proxy.multimodal.clone());
+        crate::proxy::update_stream_timeout_config(config.proxy.stream_timeouts.clone());
+        crate::proxy::update_upload_timeout_config(config.proxy.upload_timeouts.clone());
         crate::proxy::config::update_global_audit_config(
             config.proxy.experimental.payload_storage_mode.clone(),
             config.proxy.experimental.log_retention_days,
             config.proxy.experimental.thinking_store_enabled,
             config.proxy.experimental.thinking_retention_days,
             Some(config.proxy.experimental.thinking_max_memory_turns),
-        );
-        crate::proxy::config::update_global_thresholds(
-            config.proxy.experimental.context_compression_threshold_l1,
-            config.proxy.experimental.context_compression_threshold_l2,
-            config.proxy.experimental.context_compression_threshold_l3,
+            Some(config.proxy.experimental.enable_global_compaction_strip),
         );
         // 更新代理池配置
         instance
             .axum_server
             .update_proxy_pool(config.proxy.proxy_pool.clone())
             .await;
+        // 更新 QoS 自动限流进小黑屋机制开关
+        instance
+            .axum_server
+            .update_qos_auto_jail(config.proxy.qos_auto_jail);
         // 更新熔断配置
         instance
             .token_manager
             .update_circuit_breaker_config(config.circuit_breaker.clone())
             .await;
         tracing::debug!("已同步热更新反代服务配置");
+    }
+
+    // [FIX #3280, #3285] 同步热更新管理服务 (Admin Server)，确保在仅运行管理端或服务未手动启动时配置立即生效
+    let admin_lock = proxy_state.admin_server.read().await;
+    if let Some(admin) = admin_lock.as_ref() {
+        admin.axum_server.update_mapping(&config.proxy).await;
+        admin
+            .axum_server
+            .update_only_raw_quota_models(config.proxy.only_raw_quota_models)
+            .await;
+        admin
+            .axum_server
+            .update_proxy(config.proxy.upstream_proxy.clone())
+            .await;
+        admin.axum_server.update_security(&config.proxy).await;
+        admin.axum_server.update_experimental(&config.proxy).await;
+        admin.axum_server.update_debug_logging(&config.proxy).await;
+        admin.axum_server.update_user_agent(&config.proxy).await;
+        admin
+            .axum_server
+            .update_proxy_pool(config.proxy.proxy_pool.clone())
+            .await;
+        // 更新 QoS 自动限流进小黑屋机制开关
+        admin
+            .axum_server
+            .update_qos_auto_jail(config.proxy.qos_auto_jail);
+        admin
+            .axum_server
+            .token_manager
+            .update_circuit_breaker_config(config.circuit_breaker.clone())
+            .await;
+        tracing::debug!("已同步热更新管理服务器 (Admin Server) 配置");
     }
 
     Ok(())
@@ -585,9 +764,16 @@ pub async fn cancel_oauth_login() -> Result<(), String> {
 
 /// 手动提交 OAuth Code (用于 Docker/远程环境无法自动回调时)
 #[tauri::command]
-pub async fn submit_oauth_code(code: String, state: Option<String>) -> Result<(), String> {
+pub async fn submit_oauth_code(
+    app_handle: tauri::AppHandle,
+    code: String,
+    state: Option<String>,
+) -> Result<crate::models::Account, String> {
     modules::logger::log_info("收到手动提交 OAuth Code 请求");
-    modules::oauth_server::submit_oauth_code(code, state).await
+    let service = modules::account_service::AccountService::new(
+        crate::modules::integration::SystemManager::Desktop(app_handle),
+    );
+    service.submit_oauth_code(code, state).await
 }
 
 #[tauri::command]
@@ -684,16 +870,22 @@ pub async fn sync_account_from_db(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
 ) -> Result<Option<Account>, String> {
-    // Check if the current target is one we should not sync (like agy CLI)
+    // The CLI stores its login in the system keyring, not an IDE database.
     let index = modules::account::load_account_index()?;
     let current_target = index.current_target_ide.as_deref();
-    if current_target == Some("agy") {
-        modules::logger::log_info("Auto-sync skipped: current target is agy CLI");
-        return Ok(None);
-    }
+    let is_agy = current_target == Some("agy");
+    let is_acp = modules::integration::is_acp_target(current_target);
 
-    // 1. 获取 DB 中的 Refresh Token
-    let db_refresh_token = match modules::migration::get_refresh_token_from_db(current_target) {
+    // 1. Read the credential source used by the selected client. For agy/acp, do
+    // not mistake an older file/DB credential for the active client account.
+    let credential = if is_agy {
+        modules::integration::read_from_system_keyring_only().map(|state| state.refresh_token)
+    } else if is_acp {
+        modules::integration::read_acp_credentials().map(|state| state.refresh_token)
+    } else {
+        modules::migration::get_refresh_token_from_db(current_target)
+    };
+    let db_refresh_token = match credential {
         Ok(token) => token,
         Err(e) => {
             modules::logger::log_info(&format!("自动同步跳过: {}", e));
@@ -711,18 +903,20 @@ pub async fn sync_account_from_db(
             // 这里为了节省 API 流量，直接返回
             return Ok(None);
         }
-        modules::logger::log_info(&format!(
-            "检测到账号切换 ({} -> DB新账号)，正在同步...",
-            acc.email
-        ));
+        modules::logger::log_info(&format!("检测到登录凭据变化 ({})，正在同步...", acc.email));
     } else {
         modules::logger::log_info("检测到新登录账号，正在自动同步...");
     }
 
-    // 4. 执行完整导入
-    let mut account = modules::migration::import_from_db(current_target).await?;
+    // 4. For the CLI, reconcile only the matching managed account; importing
+    // all local sources could select an unrelated IDE account if refresh fails.
+    let mut account = if is_agy || is_acp {
+        modules::account::find_agy_account(modules::account::list_accounts()?, &db_refresh_token)?
+    } else {
+        modules::migration::import_from_db(current_target).await?
+    };
 
-    // 既然是从数据库导入，自动将其设为 Manager 的当前账号并保留当前 target
+    // 更新 Manager 的当前账号并保留客户端目标，不写回客户端凭据。
     let account_id = account.id.clone();
     modules::account::set_current_account_id_with_target(&account_id, current_target)?;
 
@@ -889,6 +1083,21 @@ pub async fn get_data_dir_path() -> Result<String, String> {
     Ok(modules::account::format_data_dir_path(&path))
 }
 
+/// 内部失败日志当日文件路径（按天滚动 + 容量滑动窗口）
+#[tauri::command]
+pub async fn get_internal_error_log_path() -> Result<String, String> {
+    let path = modules::logger::internal_error_log_path()?;
+    Ok(modules::account::format_data_dir_path(&path))
+}
+
+/// 内部失败日志当前占用字节数（error.log*）
+#[tauri::command]
+pub async fn get_internal_error_log_disk_size() -> Result<u64, String> {
+    tokio::task::spawn_blocking(modules::logger::internal_error_log_disk_size)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// 选择并迁移数据目录（指针写在家目录，删除旧目录后下次启动仍能找到）
 #[tauri::command]
 pub async fn set_data_dir(
@@ -897,8 +1106,17 @@ pub async fn set_data_dir(
     cf_state: tauri::State<'_, crate::commands::cloudflared::CloudflaredState>,
 ) -> Result<String, String> {
     {
-        let instance = proxy_state.instance.read().await;
-        if instance.is_some() {
+        let instance_running = proxy_state.instance.read().await.is_some();
+        let mut any_server_running = instance_running;
+        if !any_server_running {
+            for server in proxy_state.active_axum_servers().await {
+                if *server.is_running.read().await {
+                    any_server_running = true;
+                    break;
+                }
+            }
+        }
+        if any_server_running {
             return Err("请先停止 API 反代服务，再迁移数据目录".to_string());
         }
     }
@@ -1004,24 +1222,67 @@ pub async fn migrate_data_dir(new_path: String, clean_source: bool) -> Result<()
     Ok(())
 }
 
-/// 显示主窗口
+/// 显示主窗口。登录项的免打扰启动只跳过这一次自动显示。
 #[tauri::command]
-pub async fn show_main_window(window: tauri::Window) -> Result<(), String> {
-    window.show().map_err(|e| e.to_string())
+pub async fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    if crate::modules::startup_quiet::take() {
+        tracing::info!("Skipped the automatic first window show for a quiet login launch");
+        return Ok(());
+    }
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = crate::modules::lightweight::exit_lightweight_mode(&app_handle);
+        let _ = app_handle.emit("tray://show-window", ());
+    });
+    Ok(())
+}
+
+/// 从迷你悬浮窗或其他入口原子化安全切换回主控制台窗口
+#[tauri::command]
+pub async fn switch_to_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    // 统一调度到操作系统主线程执行窗口唤起与收起，消除跨线程 AppKit/Win32 冲突与 0-可见窗口悬空死锁 (Fixes #3744)
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let _ = crate::modules::lightweight::exit_lightweight_mode(&app_handle);
+        let _ = app_handle.emit("tray://show-window", ());
+
+        if !crate::modules::tray::is_mini_view_pinned() {
+            crate::modules::tray::hide_mini_window(&app_handle);
+        }
+    });
+    Ok(())
+}
+
+/// 呼出/切换迷你悬浮窗（从主控制台导航栏或其他入口调用）
+#[tauri::command]
+pub async fn show_mini_view(app: tauri::AppHandle) -> Result<(), String> {
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        crate::modules::tray::handle_tray_click(&app_handle, None);
+    });
+    Ok(())
 }
 
 /// 设置窗口主题（用于同步 Windows 标题栏按钮颜色）
 #[tauri::command]
 pub async fn set_window_theme(window: tauri::Window, theme: String) -> Result<(), String> {
-    use tauri::Theme;
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri::Theme;
 
-    let tauri_theme = match theme.as_str() {
-        "dark" => Some(Theme::Dark),
-        "light" => Some(Theme::Light),
-        _ => None, // system default
-    };
+        let tauri_theme = match theme.as_str() {
+            "dark" => Some(Theme::Dark),
+            "light" => Some(Theme::Light),
+            _ => None, // system default
+        };
 
-    window.set_theme(tauri_theme).map_err(|e| e.to_string())
+        window.set_theme(tauri_theme).map_err(|e| e.to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (window, theme);
+        Ok(())
+    }
 }
 
 /// 获取 Antigravity 可执行文件路径
@@ -1078,11 +1339,119 @@ pub async fn get_antigravity_args() -> Result<Vec<String>, String> {
 /// 检测更新响应结构
 pub use crate::modules::update_checker::UpdateInfo;
 
-/// 检测 GitHub releases 更新
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeUpdateMetadata {
+    pub rid: tauri::ResourceId,
+    pub current_version: String,
+    pub version: String,
+    pub date: Option<String>,
+    pub body: Option<String>,
+    pub raw_json: serde_json::Value,
+}
+
+/// 检测 GitHub releases 更新（支持可选显式指定更新通道）
 #[tauri::command]
-pub async fn check_for_updates() -> Result<UpdateInfo, String> {
-    modules::logger::log_info("收到前端触发的更新检查请求");
-    crate::modules::update_checker::check_for_updates().await
+pub async fn check_for_updates(
+    channel: Option<crate::modules::update_checker::UpdateChannel>,
+) -> Result<UpdateInfo, String> {
+    modules::logger::log_info(&format!(
+        "收到前端触发的更新检查请求 (channel={:?})",
+        channel
+    ));
+    if let Some(target_channel) = channel {
+        crate::modules::update_checker::check_for_updates_with_channel(target_channel).await
+    } else {
+        crate::modules::update_checker::check_for_updates().await
+    }
+}
+
+/// 基于动态通道和端点进行原生更新检查，支持预发布版 (Beta) 与正式版自动更新分离
+#[tauri::command]
+pub async fn check_native_update<R: tauri::Runtime>(
+    webview: tauri::Webview<R>,
+    endpoint: Option<String>,
+    proxy: Option<String>,
+) -> Result<Option<NativeUpdateMetadata>, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    use url::Url;
+
+    let target_endpoint = if let Some(ep) = endpoint.filter(|s| !s.trim().is_empty()) {
+        ep
+    } else {
+        let settings = crate::modules::update_checker::load_update_settings().unwrap_or_default();
+        match settings.update_channel {
+            crate::modules::update_checker::UpdateChannel::Beta => {
+                crate::modules::update_checker::PREVIEW_UPDATER_JSON_URL.to_string()
+            }
+            crate::modules::update_checker::UpdateChannel::Stable => {
+                crate::modules::update_checker::STABLE_UPDATER_JSON_URL.to_string()
+            }
+        }
+    };
+
+    crate::modules::logger::log_info(&format!("原生更新器准备检查目标地址: {}", target_endpoint));
+
+    let mut builder = webview.updater_builder();
+
+    let url = Url::parse(&target_endpoint)
+        .map_err(|e| format!("无效的更新地址 '{}': {}", target_endpoint, e))?;
+    builder = builder.endpoints(vec![url]).map_err(|e| e.to_string())?;
+
+    let proxy_url = proxy.or_else(crate::modules::update_checker::get_upstream_proxy_url);
+    if let Some(proxy_str) = proxy_url {
+        if let Ok(proxy_parsed) = Url::parse(&proxy_str) {
+            crate::modules::logger::log_info(&format!("原生更新器应用代理配置: {}", proxy_str));
+            builder = builder.proxy(proxy_parsed);
+        }
+    }
+
+    builder = builder.version_comparator(|current, release| {
+        crate::modules::update_checker::compare_versions(
+            &release.version.to_string(),
+            &current.to_string(),
+        )
+    });
+
+    let updater = builder.build().map_err(|e| {
+        let msg = format!("构建原生更新器失败: {}", e);
+        crate::modules::logger::log_error(&msg);
+        msg
+    })?;
+
+    let update = updater.check().await.map_err(|e| {
+        let msg = format!("原生更新器检查失败: {}", e);
+        crate::modules::logger::log_error(&msg);
+        msg
+    })?;
+
+    if let Some(update) = update {
+        crate::modules::logger::log_info(&format!(
+            "原生更新器发现可用更新: {} (当前版本: {})",
+            update.version, update.current_version
+        ));
+        let current_version = update.current_version.clone();
+        let version = update.version.clone();
+        let body = update.body.clone();
+        let raw_json = update.raw_json.clone();
+        let formatted_date = update.date.and_then(|date| {
+            date.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        });
+        let rid = webview.resources_table().add(update);
+        let metadata = NativeUpdateMetadata {
+            rid,
+            current_version,
+            version,
+            date: formatted_date,
+            body,
+            raw_json,
+        };
+        Ok(Some(metadata))
+    } else {
+        crate::modules::logger::log_info("原生更新器未检测到更新");
+        Ok(None)
+    }
 }
 
 #[tauri::command]
@@ -1126,12 +1495,12 @@ pub async fn get_update_settings() -> Result<crate::modules::update_checker::Upd
     crate::modules::update_checker::load_update_settings()
 }
 
-/// 保存更新设置
+/// 保存更新设置（局部更新：仅覆盖传入字段）
 #[tauri::command]
 pub async fn save_update_settings(
-    settings: crate::modules::update_checker::UpdateSettings,
+    settings: crate::modules::update_checker::UpdateSettingsPatch,
 ) -> Result<(), String> {
-    crate::modules::update_checker::save_update_settings(&settings)
+    crate::modules::update_checker::patch_update_settings(settings).map(|_| ())
 }
 
 /// 切换账号的反代禁用状态
@@ -1149,41 +1518,8 @@ pub async fn toggle_proxy_status(
         if enable { "启用" } else { "禁用" }
     ));
 
-    // 1. 读取账号文件
-    let data_dir = modules::account::get_data_dir()?;
-    let account_path = data_dir
-        .join("accounts")
-        .join(format!("{}.json", account_id));
-
-    if !account_path.exists() {
-        return Err(format!("账号文件不存在: {}", account_id));
-    }
-
-    let content =
-        std::fs::read_to_string(&account_path).map_err(|e| format!("读取账号文件失败: {}", e))?;
-
-    let mut account_json: serde_json::Value =
-        serde_json::from_str(&content).map_err(|e| format!("解析账号文件失败: {}", e))?;
-
-    // 2. 更新 proxy_disabled 字段
-    if enable {
-        // 启用反代
-        account_json["proxy_disabled"] = serde_json::Value::Bool(false);
-        account_json["proxy_disabled_reason"] = serde_json::Value::Null;
-        account_json["proxy_disabled_at"] = serde_json::Value::Null;
-    } else {
-        // 禁用反代
-        let now = chrono::Utc::now().timestamp();
-        account_json["proxy_disabled"] = serde_json::Value::Bool(true);
-        account_json["proxy_disabled_at"] = serde_json::Value::Number(now.into());
-        account_json["proxy_disabled_reason"] =
-            serde_json::Value::String(reason.unwrap_or_else(|| "用户手动禁用".to_string()));
-    }
-
-    // 3. 保存到磁盘
-    let json_str = serde_json::to_string_pretty(&account_json)
-        .map_err(|e| format!("序列化账号数据失败: {}", e))?;
-    std::fs::write(&account_path, json_str).map_err(|e| format!("写入账号文件失败: {}", e))?;
+    // 1. 调用统一模块更新账号反代状态（同步持久化账号文件与 accounts.json 索引，避免状态漂移）
+    modules::account::toggle_proxy_status(&account_id, enable, reason.as_deref())?;
 
     modules::logger::log_info(&format!(
         "账号反代状态已更新: {} ({})",
@@ -1191,34 +1527,58 @@ pub async fn toggle_proxy_status(
         if enable { "已启用" } else { "已禁用" }
     ));
 
-    // 4. 如果反代服务正在运行,立刻同步到内存池（避免禁用后仍被选中）
-    {
-        let instance_lock = proxy_state.instance.read().await;
-        if let Some(instance) = instance_lock.as_ref() {
-            // 如果禁用的是当前固定账号，则自动关闭固定模式（内存 + 配置持久化）
-            if !enable {
-                let pref_id = instance.token_manager.get_preferred_account().await;
-                if pref_id.as_deref() == Some(&account_id) {
-                    instance.token_manager.set_preferred_account(None).await;
+    // 4. 如果反代服务正在运行,立刻同步到所有活跃内存池（覆盖 instance 与 admin_server）
+    for tm in proxy_state.active_token_managers().await {
+        // 如果禁用的是当前固定账号，则自动关闭固定模式（内存 + 配置持久化）
+        if !enable {
+            let pref_id = tm.get_preferred_account().await;
+            if pref_id.as_deref() == Some(&account_id) {
+                tm.set_preferred_account(None).await;
 
-                    if let Ok(mut cfg) = crate::modules::config::load_app_config() {
-                        if cfg.proxy.preferred_account_id.as_deref() == Some(&account_id) {
-                            cfg.proxy.preferred_account_id = None;
-                            let _ = crate::modules::config::save_app_config(&cfg);
-                        }
+                if let Ok(mut cfg) = crate::modules::config::load_app_config() {
+                    if cfg.proxy.preferred_account_id.as_deref() == Some(&account_id) {
+                        cfg.proxy.preferred_account_id = None;
+                        let _ = crate::modules::config::save_app_config(&cfg);
                     }
                 }
             }
-
-            instance
-                .token_manager
-                .reload_account(&account_id)
-                .await
-                .map_err(|e| format!("同步账号失败: {}", e))?;
+        } else {
+            // 手动重新启用时，清理遗留 QoS 隔离/失败计数/模型临时熔断/内存限流锁定
+            tm.prepare_manual_enable(&account_id);
         }
+
+        tm.reload_account(&account_id)
+            .await
+            .map_err(|e| format!("同步账号失败: {}", e))?;
     }
 
     // 5. 更新托盘菜单
+    crate::modules::tray::update_tray_menus(&app);
+
+    Ok(())
+}
+
+/// 清除账号的 403 系统锁及模型级冻结状态并同步内存池
+#[tauri::command]
+pub async fn clear_account_forbidden(
+    app: tauri::AppHandle,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> Result<(), String> {
+    modules::logger::log_info(&format!("清除账号 403 锁定: {}", account_id));
+
+    // 1. 调用模块清除 403 系统锁
+    modules::account::clear_account_forbidden_lock(&account_id)?;
+
+    // 2. 同步清理内存池状态并重载
+    for tm in proxy_state.active_token_managers().await {
+        tm.prepare_manual_enable(&account_id);
+        tm.reload_account(&account_id)
+            .await
+            .map_err(|e| format!("同步账号失败: {}", e))?;
+    }
+
+    // 3. 更新托盘菜单
     crate::modules::tray::update_tray_menus(&app);
 
     Ok(())
@@ -1234,6 +1594,59 @@ pub async fn warm_up_all_accounts() -> Result<String, String> {
 #[tauri::command]
 pub async fn warm_up_account(account_id: String) -> Result<String, String> {
     modules::quota::warm_up_account(&account_id).await
+}
+
+/// Save account priority and apply it to the running proxy.
+#[tauri::command]
+pub async fn update_account_priority(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+    priority: u8,
+    model_priorities: Option<std::collections::HashMap<String, u8>>,
+) -> Result<(), String> {
+    let has_model_override = model_priorities.is_some();
+    let saved_model_priorities = modules::account::update_account_priority_with_models(
+        &account_id,
+        priority,
+        model_priorities,
+    )?;
+    for tm in proxy_state.active_token_managers().await {
+        tm.update_account_model_priorities(
+            &account_id,
+            priority,
+            if has_model_override {
+                Some(saved_model_priorities.clone())
+            } else {
+                None
+            },
+        );
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn update_account_project_id(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+    project_id: Option<String>,
+) -> Result<(), String> {
+    modules::account::update_account_project_id(&account_id, project_id.clone())?;
+    for tm in proxy_state.active_token_managers().await {
+        tm.update_account_project_id(&account_id, project_id.clone());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn auto_fetch_account_project_id(
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
+    account_id: String,
+) -> Result<String, String> {
+    let pid = modules::account::auto_fetch_account_project_id(&account_id).await?;
+    for tm in proxy_state.active_token_managers().await {
+        tm.update_account_project_id(&account_id, Some(pid.clone()));
+    }
+    Ok(pid)
 }
 
 /// 更新账号自定义标签
@@ -1316,6 +1729,14 @@ pub async fn save_http_api_settings(
 pub use crate::modules::token_stats::{AccountTokenStats, TokenStatsAggregated, TokenStatsSummary};
 
 #[tauri::command]
+pub async fn get_token_stats_minute(
+    minutes: i64,
+    step_minutes: i64,
+) -> Result<Vec<TokenStatsAggregated>, String> {
+    crate::modules::token_stats::get_minute_stats(minutes, step_minutes)
+}
+
+#[tauri::command]
 pub async fn get_token_stats_hourly(hours: i64) -> Result<Vec<TokenStatsAggregated>, String> {
     crate::modules::token_stats::get_hourly_stats(hours)
 }
@@ -1343,22 +1764,42 @@ pub async fn get_token_stats_summary(hours: i64) -> Result<TokenStatsSummary, St
 #[tauri::command]
 pub async fn get_token_stats_by_model(
     hours: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTokenStats>, String> {
-    crate::modules::token_stats::get_model_stats(hours)
+    crate::modules::token_stats::get_model_stats(hours, view_mode.as_deref())
+}
+
+#[tauri::command]
+pub async fn get_token_stats_model_trend_minute(
+    minutes: i64,
+    step_minutes: i64,
+    view_mode: Option<String>,
+) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
+    crate::modules::token_stats::get_model_trend_minute(minutes, step_minutes, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_hourly(
     hours: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_hourly(hours)
+    crate::modules::token_stats::get_model_trend_hourly(hours, view_mode.as_deref())
 }
 
 #[tauri::command]
 pub async fn get_token_stats_model_trend_daily(
     days: i64,
+    view_mode: Option<String>,
 ) -> Result<Vec<crate::modules::token_stats::ModelTrendPoint>, String> {
-    crate::modules::token_stats::get_model_trend_daily(days)
+    crate::modules::token_stats::get_model_trend_daily(days, view_mode.as_deref())
+}
+
+#[tauri::command]
+pub async fn get_token_stats_account_trend_minute(
+    minutes: i64,
+    step_minutes: i64,
+) -> Result<Vec<crate::modules::token_stats::AccountTrendPoint>, String> {
+    crate::modules::token_stats::get_account_trend_minute(minutes, step_minutes)
 }
 
 #[tauri::command]
@@ -1397,5 +1838,132 @@ pub async fn query_transit_info(url: String, key: String) -> Result<String, Stri
         Ok(text)
     } else {
         Err(format!("HTTP {}: {}", status, text))
+    }
+}
+
+/// 优雅关闭网关服务并退出应用
+#[tauri::command]
+pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    crate::linux_display_guard::mark_user_initiated_exit();
+
+    use tauri::Manager;
+    tauri::async_runtime::spawn(async move {
+        tracing::info!("[Command] 退出应用触发，开始全面清理服务与端口...");
+
+        let state = app.state::<crate::commands::proxy::ProxyServiceState>();
+        let cf_state = app.state::<crate::commands::cloudflared::CloudflaredState>();
+
+        // 1. 终止 cloudflared 隧道子进程
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), cf_state.stop()).await;
+
+        // 2. 停止 Admin Server（关闭 TCP 监听器和所有活动连接）
+        if let Ok(mut lock) = tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            state.admin_server.write(),
+        )
+        .await
+        {
+            if let Some(admin) = lock.take() {
+                admin.stop().await;
+            }
+        }
+
+        // 3. 停止业务代理实例及后台任务
+        if let Ok(mut lock) = tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            state.instance.write(),
+        )
+        .await
+        {
+            if let Some(inst) = lock.take() {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    inst.token_manager
+                        .graceful_shutdown(std::time::Duration::from_millis(400)),
+                )
+                .await;
+                inst.axum_server.set_running(false).await;
+                inst.axum_server.stop();
+            }
+        }
+
+        // 4. 给予底层套接字彻底注销的微小缓冲，然后干净退出进程
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // `process::exit` 会绕过 Tauri 事件循环，签名缓存必须在退出前主动 flush。
+        crate::proxy::signature_cache::flush_on_exit();
+        std::process::exit(0);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_mini_view_pinned(pinned: bool) {
+    crate::modules::tray::set_mini_view_pinned(pinned);
+}
+
+#[tauri::command]
+pub fn is_mini_view_pinned() -> bool {
+    crate::modules::tray::is_mini_view_pinned()
+}
+
+#[tauri::command]
+pub fn set_mini_view_active(active: bool) {
+    crate::modules::tray::set_mini_view_active(active);
+}
+
+/// 安全收起/关闭迷你悬浮窗
+#[tauri::command]
+pub fn hide_mini_view(app: tauri::AppHandle) {
+    crate::modules::tray::hide_mini_window(&app);
+}
+
+#[tauri::command]
+pub fn update_tray_for_account(app: tauri::AppHandle, account_id: Option<String>) {
+    crate::modules::tray::set_tray_selected_account_id(account_id);
+    crate::modules::tray::update_tray_menus(&app);
+}
+
+#[cfg(test)]
+mod agy_account_sync_tests {
+    use crate::models::{Account, TokenData};
+    use crate::modules::account::find_agy_account;
+
+    fn account(id: &str, refresh_token: &str) -> Account {
+        Account::new(
+            id.into(),
+            format!("{id}@example.test"),
+            TokenData::new(
+                "access-token".into(),
+                refresh_token.into(),
+                3600,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ),
+        )
+    }
+
+    #[test]
+    fn selects_keyring_account_instead_of_first_managed_account() {
+        let selected = find_agy_account(
+            vec![
+                account("old", "old-token"),
+                account("active", "active-token"),
+            ],
+            "active-token",
+        )
+        .unwrap();
+        assert_eq!(selected.id, "active");
+    }
+
+    #[test]
+    fn rejects_unknown_or_empty_credentials_without_selecting_another_account() {
+        let error =
+            find_agy_account(vec![account("old", "old-token")], "unknown-token").unwrap_err();
+        assert!(!error.contains("unknown-token"));
+        assert!(find_agy_account(vec![account("empty", "")], "").is_err());
     }
 }

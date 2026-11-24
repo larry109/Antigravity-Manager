@@ -14,9 +14,6 @@ pub struct QuotaBucket {
     /// Successful bucket observation time in milliseconds; absent in older snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<i64>,
-    /// First observed early reset, in seconds; normal cycles start seven days before reset.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cycle_start: Option<i64>,
     /// Usage recorded by this instance, populated only when returning the account list.
     #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
     pub cycle_tokens: Option<u64>,
@@ -38,23 +35,8 @@ impl QuotaBucket {
         let end = chrono::DateTime::parse_from_rfc3339(&self.reset_time)
             .ok()?
             .timestamp();
-        let normal_start = end.checked_sub(7 * 24 * 60 * 60)?;
-        let start = self.cycle_start.unwrap_or(normal_start);
-        (normal_start <= start && start <= now && now < end).then_some((start, end))
-    }
-
-    /// Called only for a newer observation of the same bucket by the existing merge.
-    pub(crate) fn retain_cycle_boundary(&mut self, previous: &Self, observed_at: i64) {
-        if self.reset_time == previous.reset_time {
-            self.cycle_start = previous.cycle_start;
-        }
-        let observed_secs = observed_at.div_euclid(1000);
-        if self.weekly_cycle_bounds(observed_secs).is_some()
-            && previous.weekly_cycle_bounds(observed_secs).is_some()
-            && self.remaining_fraction > previous.remaining_fraction + 1e-9
-        {
-            self.cycle_start = Some(observed_secs);
-        }
+        let start = end.checked_sub(7 * 24 * 60 * 60)?;
+        (start <= now && now < end).then_some((start, end))
     }
 }
 
@@ -64,6 +46,7 @@ pub struct QuotaGroup {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
     pub buckets: Vec<QuotaBucket>,
 }
 
@@ -90,7 +73,90 @@ pub struct ModelQuota {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supported_mime_types: Option<std::collections::HashMap<String, bool>>,
+}
+
+/// 对外暴露的模型能力与元数据投影（用于 /v1/models 与模型检索）
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelListingMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_images: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_mime_types: Option<std::collections::HashMap<String, bool>>,
+}
+
+impl ModelListingMeta {
+    /// 逐字段合并：当前字段为 None 时，用 other 的对应字段填充；保持先见者优先的稳定性
+    pub fn merge_from(&mut self, other: &Self) {
+        if self.display_name.is_none() {
+            self.display_name = other.display_name.clone();
+        }
+        if self.supports_images.is_none() {
+            self.supports_images = other.supports_images;
+        }
+        if self.supports_thinking.is_none() {
+            self.supports_thinking = other.supports_thinking;
+        }
+        if self.thinking_budget.is_none() {
+            self.thinking_budget = other.thinking_budget;
+        }
+        if self.recommended.is_none() {
+            self.recommended = other.recommended;
+        }
+        if self.max_tokens.is_none() {
+            self.max_tokens = other.max_tokens;
+        }
+        if self.max_output_tokens.is_none() {
+            self.max_output_tokens = other.max_output_tokens;
+        }
+        if self.supported_mime_types.is_none() {
+            self.supported_mime_types = other.supported_mime_types.clone();
+        }
+    }
+}
+
+impl From<&ModelQuota> for ModelListingMeta {
+    fn from(q: &ModelQuota) -> Self {
+        Self {
+            display_name: q.display_name.clone(),
+            supports_images: q.supports_images,
+            supports_thinking: q.supports_thinking,
+            thinking_budget: q.thinking_budget,
+            recommended: q.recommended,
+            max_tokens: q.max_tokens,
+            max_output_tokens: q.max_output_tokens,
+            supported_mime_types: q.supported_mime_types.clone(),
+        }
+    }
+}
+
+impl From<&crate::models::OfficialModelInfo> for ModelListingMeta {
+    fn from(info: &crate::models::OfficialModelInfo) -> Self {
+        Self {
+            display_name: info.display_name.clone(),
+            supports_images: info.supports_images,
+            supports_thinking: info.supports_thinking,
+            thinking_budget: info.thinking_budget.map(|b| b as i32),
+            recommended: info.recommended,
+            max_tokens: info.max_tokens.map(|t| t as i32),
+            max_output_tokens: info.max_output_tokens.map(|t| t as i32),
+            supported_mime_types: info.supported_mime_types.clone(),
+        }
+    }
 }
 
 /// 配额数据结构
@@ -103,9 +169,12 @@ pub struct QuotaData {
     /// 禁止访问的原因 (403 详细信息)
     #[serde(default)]
     pub forbidden_reason: Option<String>,
-    /// 订阅等级 (FREE/PRO/ULTRA)
+    /// 订阅等级 (FREE/PRO/ULTRA/ENTERPRISE)
     #[serde(default)]
     pub subscription_tier: Option<String>,
+    /// 原始未归一化的订阅等级代码 (如 "GCP_GE_PAYGO_TIER", "g1-pro-tier")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_tier: Option<String>,
     /// 模型淘汰重定向规则表 (old_model_id -> new_model_id)
     #[serde(default)]
     pub model_forwarding_rules: std::collections::HashMap<String, String>,
@@ -122,6 +191,7 @@ impl QuotaData {
             is_forbidden: false,
             forbidden_reason: None,
             subscription_tier: None,
+            raw_tier: None,
             model_forwarding_rules: std::collections::HashMap::new(),
             quota_groups: None,
         }
@@ -151,9 +221,9 @@ impl QuotaData {
     }
 }
 
-/// 是否为三个已知等级之一
+/// 是否为已知等级之一 (ULTRA | PRO | FREE | ENTERPRISE)
 pub fn is_known_tier(tier: &str) -> bool {
-    matches!(tier, "ULTRA" | "PRO" | "FREE")
+    matches!(tier, "ULTRA" | "PRO" | "FREE" | "ENTERPRISE")
 }
 
 /// 订阅等级标准化：统一规范为 "ULTRA" | "PRO" | "FREE"
@@ -190,6 +260,16 @@ pub fn normalize_subscription_tier(tier: &str) -> String {
         return "PRO".to_string();
     }
 
+    // 4) 企业 / GCP 档：standard-tier / "Antigravity" enterprise / GCP_* / business / vertex
+    if lower.contains("enterprise")
+        || lower.contains("standard")
+        || lower.contains("business")
+        || lower.starts_with("gcp_")
+        || lower.contains("vertex")
+    {
+        return "ENTERPRISE".to_string();
+    }
+
     tier.to_string()
 }
 
@@ -221,7 +301,7 @@ pub fn resolve_subscription_tier(raw_tier: Option<&str>) -> String {
 pub fn tier_priority(tier: Option<&str>) -> u8 {
     match normalize_subscription_tier(tier.unwrap_or("")).as_str() {
         "ULTRA" => 0,
-        "PRO" => 1,
+        "PRO" | "ENTERPRISE" => 1,
         _ => 2,
     }
 }
@@ -241,9 +321,14 @@ mod tests {
         // 上游真实 id（loadCodeAssist 返回的权威字段）
         assert_eq!(normalize_subscription_tier("free-tier"), "FREE");
         assert_eq!(normalize_subscription_tier("g1-pro-tier"), "PRO");
+        assert_eq!(normalize_subscription_tier("standard-tier"), "ENTERPRISE");
         assert_eq!(
-            normalize_subscription_tier("standard-tier"),
-            "standard-tier"
+            normalize_subscription_tier("GCP_ENTERPRISE_TIER"),
+            "ENTERPRISE"
+        );
+        assert_eq!(
+            normalize_subscription_tier("GCP_GE_PAYGO_TIER"),
+            "ENTERPRISE"
         );
         assert_eq!(normalize_subscription_tier("g1-ultra-tier"), "ULTRA");
         assert_eq!(normalize_subscription_tier("GOOGLE_ONE_HELIUM"), "ULTRA");
@@ -346,5 +431,87 @@ mod tests {
         quota.subscription_tier = None;
         quota.ensure_subscription_tier();
         assert_eq!(quota.subscription_tier, None);
+    }
+
+    #[test]
+    fn test_quota_group_deserialization_with_missing_buckets() {
+        let json = r#"{"display_name":"Gemini Models"}"#;
+        let group: QuotaGroup =
+            serde_json::from_str(json).expect("Should deserialize with missing buckets");
+        assert_eq!(group.display_name, "Gemini Models");
+        assert!(group.buckets.is_empty());
+    }
+
+    #[test]
+    fn test_model_listing_meta_serialization_skips_none() {
+        let meta = ModelListingMeta {
+            display_name: Some("Gemini 3.7 Flash".to_string()),
+            supports_images: Some(true),
+            supports_thinking: Some(true),
+            thinking_budget: Some(2048),
+            ..Default::default()
+        };
+        let val = serde_json::to_value(&meta).unwrap();
+        assert_eq!(val["display_name"], "Gemini 3.7 Flash");
+        assert_eq!(val["supports_images"], true);
+        assert_eq!(val["supports_thinking"], true);
+        assert_eq!(val["thinking_budget"], 2048);
+        assert!(val.get("max_tokens").is_none());
+        assert!(val.get("max_output_tokens").is_none());
+        assert!(val.get("recommended").is_none());
+        assert!(val.get("supported_mime_types").is_none());
+    }
+
+    #[test]
+    fn test_model_listing_meta_merge_from() {
+        let mut meta_a = ModelListingMeta {
+            display_name: Some("Model A".to_string()),
+            supports_images: Some(true),
+            ..Default::default()
+        };
+        let meta_b = ModelListingMeta {
+            display_name: Some("Model B".to_string()),
+            supports_images: Some(false),
+            supports_thinking: Some(true),
+            max_output_tokens: Some(8192),
+            ..Default::default()
+        };
+        meta_a.merge_from(&meta_b);
+
+        // 先见者优先 (meta_a 保持已有值)
+        assert_eq!(meta_a.display_name.as_deref(), Some("Model A"));
+        assert_eq!(meta_a.supports_images, Some(true));
+        // None 字段被补全
+        assert_eq!(meta_a.supports_thinking, Some(true));
+        assert_eq!(meta_a.max_output_tokens, Some(8192));
+    }
+
+    #[test]
+    fn test_model_listing_meta_from_model_quota() {
+        let quota = ModelQuota {
+            name: "gemini-3.7-flash-high".to_string(),
+            percentage: 100,
+            reset_time: "2026-10-16T10:00:00Z".to_string(),
+            display_name: Some("Gemini 3.7 Flash (High)".to_string()),
+            supports_images: Some(true),
+            supports_thinking: Some(true),
+            thinking_budget: Some(1024),
+            recommended: Some(true),
+            max_tokens: Some(1048576),
+            max_output_tokens: Some(65536),
+            model: None,
+            supported_mime_types: None,
+        };
+        let meta = ModelListingMeta::from(&quota);
+        assert_eq!(
+            meta.display_name.as_deref(),
+            Some("Gemini 3.7 Flash (High)")
+        );
+        assert_eq!(meta.supports_images, Some(true));
+        assert_eq!(meta.supports_thinking, Some(true));
+        assert_eq!(meta.thinking_budget, Some(1024));
+        assert_eq!(meta.recommended, Some(true));
+        assert_eq!(meta.max_tokens, Some(1048576));
+        assert_eq!(meta.max_output_tokens, Some(65536));
     }
 }

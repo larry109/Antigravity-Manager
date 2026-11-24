@@ -3,14 +3,6 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 fn get_antigravity_path(target_ide: Option<&str>) -> Option<PathBuf> {
-    if let Ok(config) = crate::modules::config::load_app_config() {
-        if let Some(path_str) = config.antigravity_executable {
-            let path = PathBuf::from(path_str);
-            if path.exists() {
-                return Some(path);
-            }
-        }
-    }
     crate::modules::process::get_antigravity_executable_path(target_ide)
 }
 
@@ -42,13 +34,10 @@ pub fn get_all_candidate_db_paths(target_ide: Option<&str>) -> Vec<PathBuf> {
     }
 
     let folder_names: &[&str] = if target_ide == Some("ide") {
-        &["Antigravity IDE", "Antigravity"]
-    } else if target_ide == Some("code") || target_ide == Some("cursor") {
-        &["Antigravity", "Antigravity IDE"]
-    } else if target_ide == Some("classic") {
-        &["Antigravity"]
+        &["Antigravity IDE", "antigravity-ide", "antigravity_ide"]
     } else {
-        &["Antigravity", "Antigravity IDE"]
+        // target_ide = None 或 classic / code / cursor: 严格使用 Antigravity，严禁回退至 Antigravity IDE
+        &["Antigravity"]
     };
 
     #[cfg(target_os = "macos")]
@@ -85,6 +74,16 @@ pub fn get_all_candidate_db_paths(target_ide: Option<&str>) -> Vec<PathBuf> {
     paths
 }
 
+/// 扫描本地所有 Antigravity 数据库候选路径（同时覆盖经典款 Antigravity 与 Antigravity IDE）
+pub fn get_all_antigravity_db_paths() -> Vec<PathBuf> {
+    let mut all_paths = Vec::new();
+    all_paths.extend(get_all_candidate_db_paths(Some("classic")));
+    all_paths.extend(get_all_candidate_db_paths(Some("ide")));
+    let mut seen = std::collections::HashSet::new();
+    all_paths.retain(|p| seen.insert(p.clone()));
+    all_paths
+}
+
 /// Get Antigravity database path (cross-platform)
 pub fn get_db_path(target_ide: Option<&str>) -> Result<PathBuf, String> {
     let candidates = get_all_candidate_db_paths(target_ide);
@@ -110,17 +109,22 @@ pub fn inject_token(
     project_id: Option<&str>,
     id_token: Option<&str>,
     oauth_client_key: Option<&str>,
-    target_ide: Option<&str>,
+    _target_ide: Option<&str>,
 ) -> Result<String, String> {
     crate::modules::logger::log_info("Starting Token injection...");
 
-    // 如果使用的是本项目的内置 Client ID (antigravity_enterprise 实际上是标准版)
-    // 则强制关闭 GCP TOS 标志，以确保 IDE 使用标准 Client ID 进行刷新
+    // 针对个人客户端（如内置标准客户端 antigravity_enterprise），若检测到误标 is_gcp_tos 则进行修正
+    // 但若为企业/GCP 客户端 (antigravity_gcp 等)，必须保留 is_gcp_tos = true
     if let Some(key) = oauth_client_key {
-        if key == "antigravity_enterprise" {
+        if crate::modules::oauth::is_gcp_enterprise_client(Some(key)) {
+            crate::modules::logger::log_info(
+                "[DB] GCP Enterprise client detected, preserving is_gcp_tos = true for injection.",
+            );
+            is_gcp_tos = true;
+        } else if key == "antigravity_enterprise" || key == "antigravity_personal" {
             if is_gcp_tos {
                 crate::modules::logger::log_info(
-                    "[DB] Built-in client detected, forcing Standard mode for injection.",
+                    "[DB] Standard client detected, forcing Standard mode for injection.",
                 );
                 is_gcp_tos = false;
             }
@@ -155,6 +159,12 @@ fn inject_new_format(
     id_token: Option<&str>,
 ) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
+
+    // 忙等待：热切号场景下 Antigravity 仍在运行，数据库中可能存在并发写者；
+    // 显式设置 busy_timeout，让 SQLite 在瞬时锁竞争时等待重试，而不是立刻抛 SQLITE_BUSY
+    // （rusqlite 默认 busy_timeout = 0，写入会被瞬时锁直接拒绝）。
+    conn.busy_timeout(std::time::Duration::from_millis(2000))
+        .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
 
     // Create OAuthTokenInfo (binary)
     let oauth_info = protobuf::create_oauth_info(
@@ -209,6 +219,30 @@ fn inject_new_format(
         ["antigravityOnboarding", "true"],
     )
     .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
+
+    // 对齐 IDE 安全条款与声明确认状态，消除切号后弹出“Security Notice & Data Use”条款确认卡片
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+        ["agy.onboarding.lastLoginUsername", email],
+    );
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+        [
+            "agy.onboarding.lastLoginIsGcpTos",
+            if is_gcp_tos { "true" } else { "false" },
+        ],
+    );
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+        ["jetski.onboarding.lastLoginUsername", email],
+    );
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
+        [
+            "jetski.onboarding.lastLoginIsGcpTos",
+            if is_gcp_tos { "true" } else { "false" },
+        ],
+    );
 
     // Fix for missing history: Delete the old format state to prevent the IDE from reading a stale UserID
     // which causes history fetching to fail.
@@ -266,6 +300,10 @@ pub fn write_service_machine_id(
 ) -> Result<(), String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
 
+    // 同 `inject_new_format`：热切号时应用仍在运行，忙等待避免瞬时锁竞争导致写入失败
+    conn.busy_timeout(std::time::Duration::from_millis(2000))
+        .map_err(|e| format!("Failed to set busy_timeout: {}", e))?;
+
     conn.execute(
         "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
         ["telemetry.serviceMachineId", service_machine_id],
@@ -278,4 +316,47 @@ pub fn write_service_machine_id(
     ));
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ide_candidate_db_paths_includes_all_naming_variants() {
+        let ide_candidates = get_all_candidate_db_paths(Some("ide"));
+        let path_strings: Vec<String> = ide_candidates
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        // 验证候选路径包含三种标准命名变体：空格、中划线与下划线
+        let has_space_variant = path_strings.iter().any(|s| s.contains("Antigravity IDE"));
+        let has_kebab_variant = path_strings.iter().any(|s| s.contains("antigravity-ide"));
+        let has_snake_variant = path_strings.iter().any(|s| s.contains("antigravity_ide"));
+
+        assert!(
+            has_space_variant,
+            "IDE candidates must include 'Antigravity IDE'"
+        );
+        assert!(
+            has_kebab_variant,
+            "IDE candidates must include kebab-case 'antigravity-ide'"
+        );
+        assert!(
+            has_snake_variant,
+            "IDE candidates must include snake-case 'antigravity_ide'"
+        );
+
+        // 验证严格隔离：针对 IDE 目标绝不包含纯经典版 'Antigravity/User/globalStorage' 路径
+        for p in &path_strings {
+            let is_classic = p.ends_with("Antigravity/User/globalStorage/state.vscdb")
+                || p.ends_with("Antigravity\\User\\globalStorage\\state.vscdb");
+            assert!(
+                !is_classic,
+                "IDE candidate paths must not contain classic Antigravity path: {}",
+                p
+            );
+        }
+    }
 }

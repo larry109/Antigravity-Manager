@@ -62,7 +62,10 @@ pub fn redact_header_value(name: &str, value: &str) -> String {
         return value.to_string();
     }
     let trimmed = value.trim();
-    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
+    if trimmed
+        .get(..7)
+        .map_or(false, |p| p.eq_ignore_ascii_case("bearer "))
+    {
         return "Bearer ***REDACTED***".to_string();
     }
     "***REDACTED***".to_string()
@@ -238,98 +241,171 @@ fn simplify_message(msg: &Value) -> Value {
     Value::Object(out)
 }
 
+fn redact_data_url(url_str: &str) -> String {
+    if url_str.starts_with("data:") {
+        let comma_pos = url_str.find(',').unwrap_or(0);
+        let header = &url_str[..comma_pos];
+        let len = url_str.len().saturating_sub(comma_pos);
+        format!("{},[base64 image: {} bytes]", header, len)
+    } else {
+        url_str.to_string()
+    }
+}
+
+fn simplify_image_url_value(img_url: &Value) -> Value {
+    if let Some(url_str) = img_url.as_str() {
+        return Value::String(redact_data_url(url_str));
+    }
+    if let Some(obj) = img_url.as_object() {
+        if let Some(url_str) = obj.get("url").and_then(|u| u.as_str()) {
+            if url_str.starts_with("data:") {
+                let mut cloned = obj.clone();
+                cloned.insert("url".into(), Value::String(redact_data_url(url_str)));
+                return Value::Object(cloned);
+            }
+        }
+    }
+    img_url.clone()
+}
+
+fn simplify_content_block(obj: &Map<String, Value>) -> Value {
+    let mut slim = Map::new();
+    if let Some(t) = obj.get("type") {
+        slim.insert("type".into(), t.clone());
+    }
+    if let Some(text) = obj.get("text") {
+        slim.insert("text".into(), simplify_content(text));
+    }
+    if let Some(thinking) = obj.get("thinking") {
+        slim.insert("thinking".into(), thinking.clone());
+    }
+    for sig_key in [
+        "signature",
+        "thoughtSignature",
+        "thinking_signature",
+        "thought_signature",
+    ] {
+        if let Some(sig) = obj.get(sig_key) {
+            slim.insert(sig_key.to_string(), sig.clone());
+        }
+    }
+    if let Some(id) = obj.get("id") {
+        slim.insert("id".into(), id.clone());
+    }
+    if let Some(name) = obj.get("name") {
+        slim.insert("name".into(), name.clone());
+    }
+    if let Some(input) = obj.get("input") {
+        slim.insert("input".into(), input.clone());
+    }
+    if let Some(tool_use_id) = obj.get("tool_use_id") {
+        slim.insert("tool_use_id".into(), tool_use_id.clone());
+    }
+    if let Some(is_error) = obj.get("is_error") {
+        slim.insert("is_error".into(), is_error.clone());
+    }
+    if let Some(nested_content) = obj.get("content") {
+        slim.insert("content".into(), simplify_content(nested_content));
+    }
+    if let Some(source) = obj.get("source") {
+        if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
+            let media_type = source
+                .get("media_type")
+                .cloned()
+                .unwrap_or(json!("unknown"));
+            let len = source
+                .get("data")
+                .and_then(|d| d.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
+            slim.insert(
+                "source".into(),
+                json!({
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": format!("[base64 image: {} bytes]", len)
+                }),
+            );
+        } else {
+            slim.insert("source".into(), source.clone());
+        }
+    }
+    if let Some(img_url) = obj.get("image_url") {
+        slim.insert("image_url".into(), simplify_image_url_value(img_url));
+    }
+    if let Some(file_data) = obj.get("file_data").and_then(|v| v.as_str()) {
+        let redacted = if file_data.starts_with("data:") {
+            redact_data_url(file_data)
+        } else {
+            format!("[base64 file: {} bytes]", file_data.len())
+        };
+        slim.insert("file_data".into(), Value::String(redacted));
+    }
+    if let Some(audio_obj) = obj.get("input_audio").and_then(|v| v.as_object()) {
+        let mut audio_slim = audio_obj.clone();
+        if let Some(data_str) = audio_obj.get("data").and_then(|d| d.as_str()) {
+            audio_slim.insert(
+                "data".into(),
+                Value::String(format!("[base64 audio: {} bytes]", data_str.len())),
+            );
+        }
+        slim.insert("input_audio".into(), Value::Object(audio_slim));
+    }
+    if slim.is_empty() {
+        Value::Object(obj.clone())
+    } else {
+        Value::Object(slim)
+    }
+}
+
+/// OpenAI Responses 的 `input` 项结构与 chat message 不同（`type` / `call_id` / `arguments` /
+/// `output` 等），单独裁剪：沿用 `simplify_message` 的体积控制，再补回调试必需的字段，
+/// 同时对 `output`（如 Codex `view_image` 返回的 `function_call_output` 图片数组）与顶层 `image_url` 执行 Base64 脱敏。
+fn simplify_responses_input_item(item: &Value) -> Value {
+    let mut out = simplify_message(item);
+    if let Some(obj) = out.as_object_mut() {
+        for key in ["type", "role", "call_id", "arguments"] {
+            if let Some(v) = item.get(key) {
+                obj.insert(key.to_string(), v.clone());
+            }
+        }
+        if let Some(output) = item.get("output") {
+            obj.insert("output".to_string(), simplify_content(output));
+        }
+        if let Some(img_url) = item.get("image_url") {
+            obj.insert("image_url".to_string(), simplify_image_url_value(img_url));
+        }
+    }
+    out
+}
+
 fn simplify_content(content: &Value) -> Value {
     match content {
-        Value::String(s) => Value::String(s.clone()),
+        Value::String(s) => {
+            if s.starts_with("data:") {
+                Value::String(redact_data_url(s))
+            } else {
+                // 文本内嵌的 data URL（如序列化进 prompt 的会话转录）同样折叠，避免日志被 Base64 撑爆
+                Value::String(
+                    crate::proxy::mappers::prompt_sanitizer::PromptSanitizer::collapse_text_data_urls(
+                        s, 1024,
+                    )
+                    .unwrap_or_else(|| s.clone()),
+                )
+            }
+        }
         Value::Array(arr) => Value::Array(
             arr.iter()
                 .map(|block| {
                     if let Some(obj) = block.as_object() {
-                        let mut slim = Map::new();
-                        if let Some(t) = obj.get("type") {
-                            slim.insert("type".into(), t.clone());
-                        }
-                        if let Some(text) = obj.get("text") {
-                            slim.insert("text".into(), text.clone());
-                        }
-                        if let Some(thinking) = obj.get("thinking") {
-                            slim.insert("thinking".into(), thinking.clone());
-                        }
-                        for sig_key in [
-                            "signature",
-                            "thoughtSignature",
-                            "thinking_signature",
-                            "thought_signature",
-                        ] {
-                            if let Some(sig) = obj.get(sig_key) {
-                                slim.insert(sig_key.to_string(), sig.clone());
-                            }
-                        }
-                        if let Some(id) = obj.get("id") {
-                            slim.insert("id".into(), id.clone());
-                        }
-                        if let Some(name) = obj.get("name") {
-                            slim.insert("name".into(), name.clone());
-                        }
-                        if let Some(input) = obj.get("input") {
-                            slim.insert("input".into(), input.clone());
-                        }
-                        if let Some(tool_use_id) = obj.get("tool_use_id") {
-                            slim.insert("tool_use_id".into(), tool_use_id.clone());
-                        }
-                        if let Some(is_error) = obj.get("is_error") {
-                            slim.insert("is_error".into(), is_error.clone());
-                        }
-                        if let Some(source) = obj.get("source") {
-                            if source.get("type").and_then(|t| t.as_str()) == Some("base64") {
-                                let media_type = source
-                                    .get("media_type")
-                                    .cloned()
-                                    .unwrap_or(json!("unknown"));
-                                let len = source
-                                    .get("data")
-                                    .and_then(|d| d.as_str())
-                                    .map(|s| s.len())
-                                    .unwrap_or(0);
-                                slim.insert(
-                                    "source".into(),
-                                    json!({
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": format!("[base64 image: {} bytes]", len)
-                                    }),
-                                );
-                            } else {
-                                slim.insert("source".into(), source.clone());
-                            }
-                        }
-                        if let Some(img_url) = obj.get("image_url") {
-                            if let Some(url_str) = img_url.get("url").and_then(|u| u.as_str()) {
-                                if url_str.starts_with("data:") {
-                                    let comma_pos = url_str.find(',').unwrap_or(0);
-                                    let header = &url_str[..comma_pos];
-                                    let len = url_str.len() - comma_pos;
-                                    slim.insert("image_url".into(), json!({
-                                        "url": format!("{},[base64 image: {} bytes]", header, len)
-                                    }));
-                                } else {
-                                    slim.insert("image_url".into(), img_url.clone());
-                                }
-                            } else {
-                                slim.insert("image_url".into(), img_url.clone());
-                            }
-                        }
-                        if slim.is_empty() {
-                            Value::Object(obj.clone())
-                        } else {
-                            Value::Object(slim)
-                        }
+                        simplify_content_block(obj)
                     } else {
                         block.clone()
                     }
                 })
                 .collect(),
         ),
+        Value::Object(obj) => simplify_content_block(obj),
         other => other.clone(),
     }
 }
@@ -337,6 +413,65 @@ fn simplify_content(content: &Value) -> Value {
 /// 完整保留 tools Schema (包含所有的 functionDeclarations, parameters, googleSearch 等)，确保运维排查时能看到完整的工具定义与参数结构
 fn simplify_tools(tools: &Value) -> Value {
     tools.clone()
+}
+
+/// 精简报文字段的**展示顺序**：按用户 / 开发者关注度从高到低排列。
+/// 未列入的字段按其原有相对顺序追加在后面（依赖 `serde_json` 的 `preserve_order`）。
+/// 目标：模型 → 思考块 → 上下文 → 用量/缓存 → 工具调用 → 其余，四协议行为一致。
+const CORE_FIELD_ORDER: [&str; 22] = [
+    // 1. 模型标识
+    "model",
+    // 2. 思考块：开关 / 强度 / 内容 / 签名
+    "thinking",
+    "reasoning_effort",
+    "reasoning",
+    "reasoning_content",
+    "generationConfig",
+    "generation_config",
+    "thinking_signature",
+    "thought_signature",
+    "signature",
+    "thoughtSignature",
+    "_session_thinking_id",
+    // 3. 上下文：系统提示词与对话
+    "system",
+    "systemInstruction",
+    "instructions",
+    "messages",
+    "contents",
+    "input",
+    // 4. 用量与缓存
+    "usage",
+    "usageMetadata",
+    // 5. 工具调用（关注度次之）
+    "tool_calls",
+    "tools",
+];
+
+/// 按关注度重排顶层字段 —— **只调整顺序，不删减任何字段**。
+/// 四协议与调试日志共用，保证展示顺序一致；`request` 包装层递归重排并保持在前。
+pub fn reorder_payload_fields(value: &Value) -> Value {
+    let Value::Object(map) = value else {
+        return value.clone();
+    };
+    let mut ordered = Map::new();
+    let mut rest: Map<String, Value> = Map::new();
+    for (k, v) in map {
+        if k == "request" {
+            ordered.insert(k.clone(), reorder_payload_fields(v));
+        } else {
+            rest.insert(k.clone(), v.clone());
+        }
+    }
+    for key in CORE_FIELD_ORDER {
+        if let Some(v) = rest.remove(key) {
+            ordered.insert(key.to_string(), v);
+        }
+    }
+    for (k, v) in rest {
+        ordered.insert(k, v);
+    }
+    Value::Object(ordered)
 }
 
 pub fn simplify_payload_json(value: &Value) -> Value {
@@ -367,6 +502,11 @@ pub fn simplify_payload_json(value: &Value) -> Value {
         "reasoning",
         "reasoning_content",
         "error",
+        "gateway_error",
+        "upstream_error",
+        "type",
+        "code",
+        "status",
     ] {
         if let Some(v) = inner.get(key).or_else(|| value.get(key)) {
             concise.insert(key.to_string(), v.clone());
@@ -425,6 +565,28 @@ pub fn simplify_payload_json(value: &Value) -> Value {
         .or_else(|| value.get("systemInstruction"))
     {
         concise.insert("systemInstruction".into(), sys.clone());
+    }
+
+    // 5.5 OpenAI Responses 协议：instructions（系统指令）与 input（对话上下文）
+    //     这两个是 Responses / Codex 的核心载荷，且不是 messages 的别名 —— 不保留会让
+    //     日志里"系统提示词块与上下文块整段消失"（客户端原文看不到，而中转报文是 Gemini
+    //     格式故看起来完整）。
+    if let Some(instructions) = inner
+        .get("instructions")
+        .or_else(|| value.get("instructions"))
+    {
+        concise.insert("instructions".into(), instructions.clone());
+    }
+    if let Some(input) = inner.get("input").or_else(|| value.get("input")) {
+        concise.insert(
+            "input".into(),
+            match input {
+                Value::Array(arr) => {
+                    Value::Array(arr.iter().map(simplify_responses_input_item).collect())
+                }
+                other => other.clone(),
+            },
+        );
     }
 
     // 6. Configs (generationConfig, thinkingConfig, toolConfig, tool_config, safetySettings)
@@ -557,7 +719,9 @@ pub fn simplify_payload_json(value: &Value) -> Value {
     if concise.is_empty() {
         return simplify_unknown(value);
     }
-    Value::Object(concise)
+
+    // 按关注度重排字段：核心信息前置；未列入 CORE_FIELD_ORDER 的字段保持原相对顺序追加
+    reorder_payload_fields(&Value::Object(concise))
 }
 
 fn simplify_unknown(value: &Value) -> Value {
@@ -581,7 +745,7 @@ pub fn apply_storage_mode_to_body(raw: Option<String>, mode: &str) -> Option<Str
         return Some(raw);
     }
     match serde_json::from_str::<Value>(&raw) {
-        Ok(json) => serde_json::to_string(&simplify_payload_json(&json))
+        Ok(json) => serde_json::to_string_pretty(&simplify_payload_json(&json))
             .ok()
             .or(Some(raw)),
         Err(_) => Some(truncate_chars(&raw, 8000)),
@@ -661,6 +825,76 @@ mod tests {
             "Tools schema should be completely preserved!"
         );
         assert_eq!(simplified["model"], "gemini-2.5-pro");
+    }
+
+    #[test]
+    fn test_simplify_responses_payload_keeps_instructions_and_input() {
+        // 回归：Responses / Codex 协议的系统提示词在 `instructions`、上下文在 `input`。
+        // 这两个键一度不在白名单里 → simple 模式下整段消失（客户端原文看不到系统提示词与
+        // 上下文，而中转报文是 Gemini 格式故看起来完整）。
+        let req = json!({
+            "model": "gemini-2.5-pro",
+            "instructions": "You are Codex, a coding agent.",
+            "input": [
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "hi" }] },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" }
+            ],
+            "max_output_tokens": 1024
+        });
+
+        let simplified = simplify_payload_json(&req);
+
+        assert_eq!(
+            simplified["instructions"], "You are Codex, a coding agent.",
+            "instructions 必须保留: {simplified}"
+        );
+        assert!(
+            simplified["input"].is_array(),
+            "input 必须保留为数组: {simplified}"
+        );
+        assert_eq!(simplified["input"][0]["role"], "user");
+        assert_eq!(simplified["input"][1]["type"], "function_call_output");
+        assert_eq!(simplified["input"][1]["call_id"], "call_1");
+        assert_eq!(simplified["input"][1]["output"], "ok");
+        assert_eq!(simplified["max_output_tokens"], 1024);
+    }
+
+    #[test]
+    fn test_simplify_responses_payload_redacts_input_image_and_tool_output_base64() {
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+        let data_url = format!("data:image/png;base64,{b64}");
+        let req = json!({
+            "model": "gemini-4-argon-high",
+            "instructions": "You are Codex.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "Look at this screenshot" },
+                        { "type": "input_image", "image_url": data_url.clone() }
+                    ]
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_view_img_1",
+                    "output": [
+                        { "type": "input_image", "image_url": data_url }
+                    ]
+                }
+            ]
+        });
+
+        let simplified = simplify_payload_json(&req);
+        let serialized = serde_json::to_string(&simplified).unwrap();
+        assert!(
+            !serialized.contains(b64),
+            "Concise mode must redact base64 in both message input_image and function_call_output: {serialized}"
+        );
+        assert!(
+            serialized.contains("[base64 image:"),
+            "Redacted placeholder should be present: {serialized}"
+        );
     }
 
     #[test]

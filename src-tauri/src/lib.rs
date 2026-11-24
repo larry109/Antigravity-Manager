@@ -1,12 +1,14 @@
-mod commands;
+pub mod commands;
 pub mod constants;
 pub mod error;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
+pub mod linux_display_guard;
+#[cfg(any(target_os = "linux", test))]
 mod linux_graphics;
-mod models;
-mod modules;
-mod proxy; // Proxy service module
-mod utils;
+pub mod models;
+pub mod modules;
+pub mod proxy; // Proxy service module
+pub mod utils;
 
 use modules::logger;
 use std::sync::Arc;
@@ -75,6 +77,249 @@ fn should_enable_tray() -> bool {
     true
 }
 
+/// Login-item launches or shortcut flags pass `--minimized`, `--silent`, `--hidden`, or `-s`.
+/// Quiet startup applies only to that launch.
+fn apply_login_launch_policy(app: &tauri::App) {
+    let launched_by_login = std::env::args().any(|arg| {
+        let lower = arg.to_lowercase();
+        lower == "--minimized"
+            || lower == "--silent"
+            || lower == "--hidden"
+            || lower == "-s"
+            || lower == "/minimized"
+            || lower.contains("--minimized")
+            || lower.contains("--silent")
+            || lower.contains("--hidden")
+    });
+    if !launched_by_login {
+        return;
+    }
+
+    let config = modules::load_app_config().unwrap_or_default();
+    if !config.quiet_autostart {
+        info!("Login launch will show the main window because quiet startup is off");
+        return;
+    }
+
+    let tray_enabled = app
+        .try_state::<AppRuntimeFlags>()
+        .map(|flags| flags.tray_enabled)
+        .unwrap_or(true);
+    if !tray_enabled {
+        info!("Quiet startup skipped because the tray is unavailable; showing the main window");
+        #[cfg(not(target_os = "android"))]
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+        }
+        return;
+    }
+
+    modules::startup_quiet::arm();
+    if config.lightweight_mode {
+        info!("Quiet login launch will enter lightweight mode once the event loop is ready");
+        modules::startup_quiet::request_lightweight_on_ready();
+    } else {
+        info!("Quiet login launch will keep the main window hidden in the tray");
+        #[cfg(target_os = "macos")]
+        {
+            let _ = app
+                .handle()
+                .set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+    }
+}
+
+/// Run headless server with optional port, host, and web UI toggles
+pub async fn run_headless_server(
+    port_override: Option<u16>,
+    host_override: Option<String>,
+    disable_web_override: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // If disable_web_override is explicitly true, set ABV_DISABLE_WEB env
+    if disable_web_override {
+        std::env::set_var("ABV_DISABLE_WEB", "1");
+    }
+
+    // Initialize logger
+    logger::init_logger();
+
+    // Initialize databases
+    if let Err(e) = modules::token_stats::init_db() {
+        error!("Failed to initialize token stats database: {}", e);
+    }
+    if let Err(e) = modules::security_db::init_db() {
+        error!("Failed to initialize security database: {}", e);
+    }
+    if let Err(e) = modules::user_token_db::init_db() {
+        error!("Failed to initialize user token database: {}", e);
+    }
+
+    info!("Starting in HEADLESS mode...");
+
+    let proxy_state = commands::proxy::ProxyServiceState::new();
+    let cf_state = Arc::new(commands::cloudflared::CloudflaredState::new());
+
+    // Load config
+    let mut config = modules::config::load_app_config().unwrap_or_default();
+    let mut modified = false;
+
+    if let Some(port) = port_override {
+        config.proxy.port = port;
+        modified = true;
+    }
+
+    if let Some(host) = host_override {
+        if host == "127.0.0.1" || host == "localhost" {
+            config.proxy.allow_lan_access = false;
+        } else {
+            config.proxy.allow_lan_access = true;
+        }
+        modified = true;
+    } else {
+        // Headless/docker 默认允许 LAN 访问（绑定 0.0.0.0）
+        // 若设置 ABV_BIND_LOCAL_ONLY，则仅绑定 127.0.0.1
+        let bind_local_only = std::env::var("ABV_BIND_LOCAL_ONLY")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if bind_local_only {
+            config.proxy.allow_lan_access = false;
+            modified = true;
+        } else {
+            config.proxy.allow_lan_access = true;
+        }
+    }
+
+    // Force auth mode to AllExceptHealth in headless mode if it's Off or Auto
+    if matches!(
+        config.proxy.auth_mode,
+        crate::proxy::ProxyAuthMode::Off | crate::proxy::ProxyAuthMode::Auto
+    ) {
+        info!("Headless mode: Forcing auth_mode to AllExceptHealth for Web UI security");
+        config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
+        modified = true;
+    }
+
+    // Support API Key override from env
+    let env_key = std::env::var("ABV_API_KEY")
+        .or_else(|_| std::env::var("API_KEY"))
+        .ok();
+    if let Some(key) = env_key {
+        if !key.trim().is_empty() {
+            info!("Using API Key from environment variable");
+            config.proxy.api_key = key;
+            modified = true;
+        }
+    }
+
+    // Support Web UI Password override from env
+    let env_web_password = std::env::var("ABV_WEB_PASSWORD")
+        .or_else(|_| std::env::var("WEB_PASSWORD"))
+        .ok();
+    if let Some(pwd) = env_web_password {
+        if !pwd.trim().is_empty() {
+            info!("Using Web UI Password from environment variable");
+            config.proxy.admin_password = Some(pwd);
+            modified = true;
+        }
+    }
+
+    // Support Auth Mode override from env
+    let env_auth_mode = std::env::var("ABV_AUTH_MODE")
+        .or_else(|_| std::env::var("AUTH_MODE"))
+        .ok();
+    if let Some(mode_str) = env_auth_mode {
+        let mode = match mode_str.to_lowercase().as_str() {
+            "off" => Some(crate::proxy::ProxyAuthMode::Off),
+            "strict" => Some(crate::proxy::ProxyAuthMode::Strict),
+            "all_except_health" => Some(crate::proxy::ProxyAuthMode::AllExceptHealth),
+            "auto" => Some(crate::proxy::ProxyAuthMode::Auto),
+            _ => {
+                warn!("Invalid AUTH_MODE: {}, ignoring", mode_str);
+                None
+            }
+        };
+        if let Some(m) = mode {
+            info!("Using Auth Mode from environment variable: {:?}", m);
+            config.proxy.auth_mode = m;
+            modified = true;
+        }
+    }
+
+    let is_web_disabled = std::env::var("ABV_DISABLE_WEB")
+        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+
+    info!("--------------------------------------------------");
+    info!("🚀 Headless mode proxy service starting...");
+    info!("📍 Port: {}", config.proxy.port);
+    info!(
+        "🔑 Current API Key: {}",
+        credential_state(&config.proxy.api_key)
+    );
+    if is_web_disabled {
+        info!("🌐 Web UI: Disabled (--no-web pure proxy mode)");
+    } else {
+        if let Some(ref pwd) = config.proxy.admin_password {
+            info!("🔐 Web UI Password: {}", credential_state(pwd));
+        } else {
+            info!("🔐 Web UI Password: (Same as API Key)");
+        }
+        info!(
+            "💡 Tips: Access Web UI at http://127.0.0.1:{}",
+            config.proxy.port
+        );
+    }
+    info!(
+        "🤖 API Endpoints: http://127.0.0.1:{}/v1",
+        config.proxy.port
+    );
+    info!("--------------------------------------------------");
+
+    if modified {
+        if let Err(e) = modules::config::save_app_config(&config) {
+            error!("Failed to persist environment overrides: {}", e);
+        } else {
+            info!("Environment overrides persisted to gui_config.json");
+        }
+    }
+
+    crate::modules::hub_version::update_hub_fingerprint(
+        config.proxy.hub_version.as_deref(),
+        config.proxy.hub_cl.as_deref(),
+    );
+
+    // Start proxy service
+    if let Err(e) = commands::proxy::internal_start_proxy_service(
+        config.proxy,
+        &proxy_state,
+        crate::modules::integration::SystemManager::Headless,
+        cf_state.clone(),
+    )
+    .await
+    {
+        error!("Failed to start proxy service in headless mode: {}", e);
+        return Err(e.into());
+    }
+
+    info!("Headless proxy service is running.");
+
+    // Start smart scheduler for 7-day weekly reset warmup
+    modules::scheduler::start_scheduler(None, proxy_state.clone());
+    info!("Smart scheduler (7-Day Weekly Reset Warmup) started in headless mode.");
+
+    // Start background auto-refresh scheduler for periodic quota maintenance in headless mode (Fixes #3958)
+    modules::auto_refresh::start_auto_refresh(None, proxy_state.clone());
+    info!("Background auto-refresh scheduler started in headless mode.");
+
+    // 账号在 internal_start_proxy_service 中已完成加载，异步刷新一次全量配额
+    modules::startup_refresh::spawn_startup_quota_refresh(None, proxy_state.clone());
+
+    // Wait for Ctrl-C
+    tokio::signal::ctrl_c().await.ok();
+    info!("Headless mode shutting down");
+    Ok(())
+}
+
 fn credential_state(value: &str) -> &'static str {
     if value.trim().is_empty() {
         "not set"
@@ -87,12 +332,21 @@ fn credential_state(value: &str) -> &'static str {
 fn nvidia_proprietary_loaded() -> bool {
     std::path::Path::new("/dev/nvidia0").exists()
         || std::path::Path::new("/proc/driver/nvidia/version").exists()
+        || std::path::Path::new("/sys/module/nvidia").exists()
 }
 
 #[cfg(target_os = "linux")]
 fn configure_linux_graphics() {
+    // 确保 GLib 在未设置 G_MESSAGES_DEBUG 时不过滤底层 Gdk/Gtk 的 debug 日志
+    if std::env::var("G_MESSAGES_DEBUG").is_err() {
+        std::env::set_var("G_MESSAGES_DEBUG", "Gdk,Gtk");
+    }
+
+    linux_display_guard::init_display_guard();
+
     use linux_graphics::{
-        desktop_is_wlroots_family, should_disable_webkit_dmabuf, should_force_x11_backend,
+        desktop_is_gnome, desktop_is_kde, desktop_is_wlroots_family, is_remote_virtual_desktop,
+        should_disable_webkit_dmabuf, should_enable_software_compositing, should_force_x11_backend,
     };
 
     let is_wayland = is_wayland_session();
@@ -113,14 +367,19 @@ fn configure_linux_graphics() {
         has_x11_display,
         &desktop,
     ) {
-        // Force X11 backend under GNOME/KDE Wayland to avoid a GTK shm crash.
+        // Force X11 backend under GNOME/legacy Wayland to avoid a GTK shm crash.
         std::env::set_var("GDK_BACKEND", "x11");
         warn!(
             "Forcing GDK_BACKEND=x11 for stability on Wayland. Set ANTIGRAVITY_FORCE_WAYLAND=1 to keep Wayland backend."
         );
-    } else if is_wayland && !gdk_already_set && desktop_is_wlroots_family(&desktop) {
+    } else if is_wayland
+        && !gdk_already_set
+        && (desktop_is_wlroots_family(&desktop)
+            || desktop_is_kde(&desktop)
+            || desktop_is_gnome(&desktop))
+    {
         info!(
-            "Keeping native Wayland GDK backend on {} (Xwayland DISPLAY is not a reason to force X11).",
+            "Keeping native Wayland GDK backend on {} (avoiding Xwayland WebKitGTK frame freeze).",
             desktop
         );
     }
@@ -137,10 +396,33 @@ fn configure_linux_graphics() {
             "WEBKIT_DISABLE_DMABUF_RENDERER=1 (WebKit DMA-BUF workaround on this Wayland setup). Set it yourself to override."
         );
     }
+
+    // [Fix #3752] 针对 xrdp / VNC 等远程虚拟桌面会话，自动启用 WebKitGTK 软件安全合成与渲染
+    // 根除客户端断开时由于显存缓冲区交换失败引发的 XIO Error / Broken pipe 崩溃，普通本地桌面不受影响
+    let has_xrdp_env = std::env::var("XRDP_SESSION").is_ok()
+        || std::env::var("XRDP_SOCKET_PATH").is_ok()
+        || std::env::var("XRDP_PULSE_SINK_SOCKET").is_ok();
+    let has_vnc_env = std::env::var("VNCDESKTOP").is_ok() || std::env::var("VNC_PORT").is_ok();
+    let force_software = env_flag_enabled("ANTIGRAVITY_FORCE_SOFTWARE_RENDER");
+    let force_hardware = env_flag_enabled("ANTIGRAVITY_FORCE_HARDWARE_RENDER");
+    let is_remote_desktop =
+        is_remote_virtual_desktop(has_xrdp_env, has_vnc_env, force_software, force_hardware);
+
+    let compositing_already_disabled = std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_ok();
+    if should_enable_software_compositing(compositing_already_disabled, is_remote_desktop) {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        if std::env::var("LIBGL_ALWAYS_SOFTWARE").is_err() {
+            std::env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
+        }
+        info!(
+            "Remote virtual desktop session detected (xrdp/VNC). Enabling safe software compositing to prevent XIO crashes on disconnect."
+        );
+    }
 }
 
-/// Increase file descriptor limit for macOS to prevent "Too many open files" errors
-#[cfg(target_os = "macos")]
+/// Increase file descriptor limit on Unix (macOS/Linux) to prevent "Too many open files" errors
+#[cfg(unix)]
 fn increase_nofile_limit() {
     unsafe {
         let mut rl = libc::rlimit {
@@ -229,18 +511,39 @@ fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
 }
 
+#[cfg(not(target_os = "android"))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Record main thread ID on Linux for display disconnection guard
+    #[cfg(target_os = "linux")]
+    linux_display_guard::record_main_thread_id();
+
     // Disable Windows background throttling/EcoQoS
     #[cfg(target_os = "windows")]
     windows_api::disable_efficiency_mode();
 
     // Check for headless mode
     let args: Vec<String> = std::env::args().collect();
+
+    // Check for CLI subcommands (switch, list, current, etc.)
+    if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        match runtime.block_on(modules::cli_handler::try_handle_cli(&args)) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("\x1b[31m[Antigravity CLI Error]\x1b[0m {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let is_headless = args.iter().any(|arg| arg == "--headless");
 
-    // Increase file descriptor limit (macOS only)
-    #[cfg(target_os = "macos")]
+    // Increase file descriptor limit (Unix: macOS/Linux)
+    #[cfg(unix)]
     increase_nofile_limit();
 
     // Initialize logger
@@ -265,153 +568,11 @@ pub fn run() {
     }
 
     if is_headless {
-        info!("Starting in HEADLESS mode...");
-
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        rt.block_on(async {
-            // Initialize states manually
-            // [FIX] Initialize log bridge for headless mode
-            // Pass a dummy app handle or None since we don't have a Tauri app handle in headless mode
-            // Actually log_bridge relies on AppHandle to emit events.
-            // In headless mode, we don't emit events, but we still need the buffer.
-            // We need to modify log_bridge to handle missing AppHandle gracefully, which it already does (Option).
-            // But init_log_bridge requires AppHandle.
-            // We'll skip passing AppHandle for now and just leverage the global buffer capability.
-            // Since init_log_bridge takes AppHandle, we might need a separate init for headless or just not call init and rely on lazy init of buffer?
-            // Checking log_bridge code again...
-            // "static LOG_BUFFER: OnceLock<...> = OnceLock::new();" -> lazy init.
-            // So we just need to ensure the tracing layer is added.
-            // And `logger::init_logger()` adds the layer?
-            // Let's check `modules::logger`.
-
-            let proxy_state = commands::proxy::ProxyServiceState::new();
-            let cf_state = Arc::new(commands::cloudflared::CloudflaredState::new());
-
-            // Load config
-            match modules::config::load_app_config() {
-                Ok(mut config) => {
-                    let mut modified = false;
-                    // Headless/docker 默认允许 LAN 访问（绑定 0.0.0.0）
-                    // 若设置 ABV_BIND_LOCAL_ONLY，则仅绑定 127.0.0.1
-                    let bind_local_only = std::env::var("ABV_BIND_LOCAL_ONLY")
-                        .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-                        .unwrap_or(false);
-                    if bind_local_only {
-                        config.proxy.allow_lan_access = false;
-                        modified = true;
-                    } else {
-                        config.proxy.allow_lan_access = true;
-                    }
-
-                    // [FIX] Force auth mode to AllExceptHealth in headless mode if it's Off or Auto
-                    // This ensures Web UI login validation works properly
-                    if matches!(config.proxy.auth_mode, crate::proxy::ProxyAuthMode::Off | crate::proxy::ProxyAuthMode::Auto) {
-                        info!("Headless mode: Forcing auth_mode to AllExceptHealth for Web UI security");
-                        config.proxy.auth_mode = crate::proxy::ProxyAuthMode::AllExceptHealth;
-                        modified = true;
-                    }
-
-                    // [NEW] 支持通过环境变量注入 API Key
-                    // 优先级：ABV_API_KEY > API_KEY > 配置文件
-                    let env_key = std::env::var("ABV_API_KEY")
-                        .or_else(|_| std::env::var("API_KEY"))
-                        .ok();
-
-                    if let Some(key) = env_key {
-                        if !key.trim().is_empty() {
-                            info!("Using API Key from environment variable");
-                            config.proxy.api_key = key;
-                            modified = true;
-                        }
-                    }
-
-                    // [NEW] 支持通过环境变量注入 Web UI 密码
-                    // 优先级：ABV_WEB_PASSWORD > WEB_PASSWORD > 配置文件
-                    let env_web_password = std::env::var("ABV_WEB_PASSWORD")
-                        .or_else(|_| std::env::var("WEB_PASSWORD"))
-                        .ok();
-
-                    if let Some(pwd) = env_web_password {
-                        if !pwd.trim().is_empty() {
-                            info!("Using Web UI Password from environment variable");
-                            config.proxy.admin_password = Some(pwd);
-                            modified = true;
-                        }
-                    }
-
-                    // [NEW] 支持通过环境变量注入鉴权模式
-                    // 优先级：ABV_AUTH_MODE > AUTH_MODE > 配置文件
-                    let env_auth_mode = std::env::var("ABV_AUTH_MODE")
-                        .or_else(|_| std::env::var("AUTH_MODE"))
-                        .ok();
-
-                    if let Some(mode_str) = env_auth_mode {
-                        let mode = match mode_str.to_lowercase().as_str() {
-                            "off" => Some(crate::proxy::ProxyAuthMode::Off),
-                            "strict" => Some(crate::proxy::ProxyAuthMode::Strict),
-                            "all_except_health" => Some(crate::proxy::ProxyAuthMode::AllExceptHealth),
-                            "auto" => Some(crate::proxy::ProxyAuthMode::Auto),
-                            _ => {
-                                warn!("Invalid AUTH_MODE: {}, ignoring", mode_str);
-                                None
-                            }
-                        };
-                        if let Some(m) = mode {
-                            info!("Using Auth Mode from environment variable: {:?}", m);
-                            config.proxy.auth_mode = m;
-                            modified = true;
-                        }
-                    }
-
-                    info!("--------------------------------------------------");
-                    info!("🚀 Headless mode proxy service starting...");
-                    info!("📍 Port: {}", config.proxy.port);
-                    info!("🔑 Current API Key: {}", credential_state(&config.proxy.api_key));
-                    if let Some(ref pwd) = config.proxy.admin_password {
-                        info!("🔐 Web UI Password: {}", credential_state(pwd));
-                    } else {
-                        info!("🔐 Web UI Password: (Same as API Key)");
-                    }
-                    info!("💡 Tips: You can use these keys to login to Web UI and access AI APIs.");
-                    info!("💡 Search docker logs or grep gui_config.json to find them.");
-                    info!("--------------------------------------------------");
-
-                    // [FIX #1460] Persist environment overrides to ensure they are visible in Web UI/load_config
-                    if modified {
-                        if let Err(e) = modules::config::save_app_config(&config) {
-                            error!("Failed to persist environment overrides: {}", e);
-                        } else {
-                            info!("Environment overrides persisted to gui_config.json");
-                        }
-                    }
-
-                    // Start proxy service
-                    if let Err(e) = commands::proxy::internal_start_proxy_service(
-                        config.proxy,
-                        &proxy_state,
-                        crate::modules::integration::SystemManager::Headless,
-                        cf_state.clone(),
-                    ).await {
-                        error!("Failed to start proxy service in headless mode: {}", e);
-                        std::process::exit(1);
-                    }
-
-                    info!("Headless proxy service is running.");
-
-                    // Start smart scheduler for 7-day weekly reset warmup
-                    modules::scheduler::start_scheduler(None, proxy_state.clone());
-                    info!("Smart scheduler (7-Day Weekly Reset Warmup) started in headless mode.");
-                }
-                Err(e) => {
-                    error!("Failed to load config for headless mode: {}", e);
-                    std::process::exit(1);
-                }
-            }
-
-            // Wait for Ctrl-C
-            tokio::signal::ctrl_c().await.ok();
-            info!("Headless mode shutting down");
-        });
+        if let Err(e) = rt.block_on(run_headless_server(None, None, false)) {
+            error!("Headless server exited with error: {}", e);
+            std::process::exit(1);
+        }
         return;
     }
 
@@ -433,16 +594,27 @@ pub fn run() {
                     tauri_plugin_window_state::StateFlags::all()
                         .difference(tauri_plugin_window_state::StateFlags::VISIBLE),
                 )
+                // Fixes #3993: 插件在 on_window_ready 中会于 WebviewWindow::build 期间同步 restore_state，
+                // 此时 Tauri WindowManager/PluginStore 的非可重入 RwLock 仍被持有；Windows 上
+                // SetWindowPos 会同步回派 WM_WINDOWPOSCHANGED 并再次取锁，导致 UI 线程死锁。
+                // 跳过 main 的初始恢复，改为构建完成后再恢复（见 setup 与 lightweight::ensure_main_window）。
+                .skip_initial_state("main")
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            let _ = app.get_webview_window("main").map(|window| {
-                let _ = window.show();
-                let _ = window.set_focus();
-                #[cfg(target_os = "macos")]
-                app.set_activation_policy(tauri::ActivationPolicy::Regular)
-                    .unwrap_or(());
-            });
+            // Fixes #3993: Windows 下该回调跑在 UI 线程，且可能仍持有 PluginStore 锁；
+            // 经工作线程再投递到主线程，等当前回调返回后再重建窗口。
+            #[cfg(target_os = "windows")]
+            {
+                let app_handle = app.clone();
+                modules::lightweight::defer_on_main_thread(app, move || {
+                    let _ = modules::lightweight::exit_lightweight_mode(&app_handle);
+                });
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = modules::lightweight::exit_lightweight_mode(app);
+            }
         }))
         .manage(commands::proxy::ProxyServiceState::new())
         .manage(commands::cloudflared::CloudflaredState::new())
@@ -454,19 +626,35 @@ pub fn run() {
             modules::log_bridge::init_log_bridge(app.handle().clone());
 
             // 为主窗口显式设置应用图标（强制触发 Win32 WM_SETICON，防止透明/覆盖标题栏窗口在任务栏丢失图标）
+            #[cfg(not(target_os = "macos"))]
             if let Some(window) = app.get_webview_window("main") {
-                #[cfg(not(target_os = "macos"))]
+                let icon_bytes: &[u8] = include_bytes!("../icons/icon.png");
+                if let Ok(img) = image::load_from_memory(icon_bytes) {
+                    let rgba = img.to_rgba8();
+                    let (width, height) = rgba.dimensions();
+                    let _ = window.set_icon(tauri::image::Image::new_owned(
+                        rgba.into_raw(),
+                        width,
+                        height,
+                    ));
+                }
+            }
+
+            // Fixes #3993: 已对 main 设置 skip_initial_state，启动窗口的位置/尺寸恢复改在窗口
+            // 构建完成后的 setup 中执行，不再嵌套于构建期间（持有 Tauri 内部 RwLock）。
+            #[cfg(not(target_os = "android"))]
+            if let Some(window) = app.get_webview_window("main") {
+                use tauri_plugin_window_state::{StateFlags, WindowExt};
+                let flags = StateFlags::all().difference(StateFlags::VISIBLE);
+                #[cfg(target_os = "windows")]
                 {
-                    let icon_bytes: &[u8] = include_bytes!("../icons/icon.png");
-                    if let Ok(img) = image::load_from_memory(icon_bytes) {
-                        let rgba = img.to_rgba8();
-                        let (width, height) = rgba.dimensions();
-                        let _ = window.set_icon(tauri::image::Image::new_owned(
-                            rgba.into_raw(),
-                            width,
-                            height,
-                        ));
-                    }
+                    modules::lightweight::defer_on_main_thread(app.handle(), move || {
+                        let _ = window.restore_state(flags);
+                    });
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = window.restore_state(flags);
                 }
             }
 
@@ -478,29 +666,6 @@ pub fn run() {
                 });
             }
 
-            // Linux: Workaround for transparent window crash/freeze
-            // The transparent window feature is unstable on Linux with WebKitGTK
-            // We disable the visual alpha channel to prevent softbuffer-related crashes
-            #[cfg(target_os = "linux")]
-            {
-                use tauri::Manager;
-                if is_wayland_session() {
-                    info!("Linux Wayland session detected; skipping transparent window workaround");
-                } else if let Some(window) = app.get_webview_window("main") {
-                    // Access GTK window and disable transparency at the GTK level
-                    if let Ok(gtk_window) = window.gtk_window() {
-                        use gtk::prelude::WidgetExt;
-                        // Remove the visual's alpha channel to disable transparency
-                        if let Some(screen) = gtk_window.screen() {
-                            // Use non-composited visual if available
-                            if let Some(visual) = screen.system_visual() {
-                                gtk_window.set_visual(Some(&visual));
-                            }
-                            info!("Linux: Applied transparent window workaround");
-                        }
-                    }
-                }
-            }
 
             let runtime_flags = app.state::<AppRuntimeFlags>();
             if runtime_flags.tray_enabled {
@@ -515,6 +680,10 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 // Load config
                 if let Ok(config) = modules::config::load_app_config() {
+                    crate::modules::hub_version::update_hub_fingerprint(
+                        config.proxy.hub_version.as_deref(),
+                        config.proxy.hub_cl.as_deref(),
+                    );
                     let state = handle.state::<commands::proxy::ProxyServiceState>();
                     let cf_state = handle.state::<commands::cloudflared::CloudflaredState>();
                     let integration =
@@ -552,6 +721,13 @@ pub fn run() {
                             info!("Proxy service auto-started successfully");
                         }
                     }
+
+                    // 3. 账号加载与代理启动就绪后，异步刷新一次全量配额
+                    //    由 startup_refresh 配置开关控制，单进程仅触发一次，避免启动阶段全量轰炸
+                    modules::startup_refresh::spawn_startup_quota_refresh(
+                        Some(handle.clone()),
+                        state.inner().clone(),
+                    );
                 } else {
                     // 配置加载失败不能再被静默吞掉：否则重启后“服务没起来”时无任何痕迹可查。
                     error!(
@@ -566,31 +742,102 @@ pub fn run() {
             modules::scheduler::start_scheduler(Some(app.handle().clone()), scheduler_state.inner().clone());
             info!("Smart scheduler (7-Day Weekly Reset Warmup) initialized.");
 
+            // Start background auto-refresh scheduler (Fixes #3958)
+            modules::auto_refresh::start_auto_refresh(Some(app.handle().clone()), scheduler_state.inner().clone());
+            info!("Background auto-refresh scheduler initialized.");
+
             // [PHASE 1] 已整合至 Axum 端口 (8045)，不再单独启动 19527 端口
             info!("Management API integrated into main proxy server (port 8045)");
+
+            apply_login_launch_policy(app);
+
+            ensure_cli_symlinks();
+
+            #[cfg(target_os = "linux")]
+            {
+                tauri::async_runtime::spawn(async {
+                    use tokio::signal::unix::{signal, SignalKind};
+                    let mut sigterm = signal(SignalKind::terminate()).ok();
+                    let mut sigint = signal(SignalKind::interrupt()).ok();
+                    tokio::select! {
+                        _ = async {
+                            if let Some(ref mut s) = sigterm {
+                                s.recv().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {},
+                        _ = async {
+                            if let Some(ref mut s) = sigint {
+                                s.recv().await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => {},
+                    }
+                    tracing::info!("[Linux Display Guard] Received termination signal in background mode, shutting down cleanly.");
+                    linux_display_guard::mark_user_initiated_exit();
+                    // 信号退出不会走 Tauri 事件循环，签名缓存同样需要尽力落盘。
+                    crate::proxy::signature_cache::flush_on_exit();
+                    std::process::exit(0);
+                });
+            }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let tray_enabled = window
-                    .app_handle()
-                    .try_state::<AppRuntimeFlags>()
-                    .map(|flags| flags.tray_enabled)
-                    .unwrap_or(true);
-
-                if tray_enabled {
-                    let _ = window.hide();
-                    #[cfg(target_os = "macos")]
-                    {
-                        use tauri::Manager;
-                        window
-                            .app_handle()
-                            .set_activation_policy(tauri::ActivationPolicy::Accessory)
-                            .unwrap_or(());
+            match event {
+                tauri::WindowEvent::Focused(focused) => {
+                    if window.label() == "main" && *focused {
+                        #[cfg(target_os = "macos")]
+                        {
+                            let _ = window
+                                .app_handle()
+                                .set_activation_policy(tauri::ActivationPolicy::Regular);
+                        }
+                    } else if !focused && window.label() == "mini" {
+                        modules::tray::record_blur();
+                        if !modules::tray::is_mini_view_pinned() && modules::tray::is_mini_view_active() {
+                            modules::tray::hide_mini_window(window.app_handle());
+                        }
                     }
-                    api.prevent_close();
                 }
+                tauri::WindowEvent::CloseRequested { api, .. } => {
+                    if window.label() == "mini" {
+                        api.prevent_close();
+                        modules::tray::hide_mini_window(window.app_handle());
+                        return;
+                    }
+
+                    let tray_enabled = window
+                        .app_handle()
+                        .try_state::<AppRuntimeFlags>()
+                        .map(|flags| flags.tray_enabled)
+                        .unwrap_or(true);
+
+                    if tray_enabled {
+                        api.prevent_close();
+
+                        let is_lightweight = modules::load_app_config()
+                            .map(|c| c.lightweight_mode)
+                            .unwrap_or(false);
+
+                        if is_lightweight {
+                            let _ = modules::lightweight::enter_lightweight_mode(window.app_handle());
+                        } else {
+                            let _ = window.hide();
+                            #[cfg(target_os = "macos")]
+                            {
+                                use tauri::Manager;
+                                window
+                                    .app_handle()
+                                    .set_activation_policy(tauri::ActivationPolicy::Accessory)
+                                    .unwrap_or(());
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -598,8 +845,11 @@ pub fn run() {
             // Account management commands
             commands::list_accounts,
             commands::add_account,
+            commands::batch_import_accounts,
             commands::delete_account,
             commands::delete_accounts,
+            commands::release_account_qos_jail,
+            commands::remove_account_forbidden_model,
             commands::reorder_accounts,
             commands::switch_account,
             commands::export_accounts,
@@ -615,6 +865,7 @@ pub fn run() {
             commands::delete_device_version,
             commands::open_device_folder,
             commands::get_current_account,
+            commands::get_active_clients_status,
             // Quota commands
             commands::fetch_account_quota,
             commands::refresh_all_quotas,
@@ -642,14 +893,25 @@ pub fn run() {
             commands::get_antigravity_cache_paths,
             commands::open_data_folder,
             commands::get_data_dir_path,
+            commands::get_internal_error_log_path,
+            commands::get_internal_error_log_disk_size,
             commands::set_data_dir,
             commands::migrate_data_dir,
             commands::show_main_window,
+            commands::switch_to_main_window,
+            commands::show_mini_view,
+            commands::hide_mini_view,
+            commands::exit_app,
+            commands::set_mini_view_pinned,
+            commands::is_mini_view_pinned,
+            commands::set_mini_view_active,
+            commands::update_tray_for_account,
             commands::set_window_theme,
             commands::get_antigravity_path,
             commands::get_antigravity_cli_path,
             commands::get_antigravity_args,
             commands::check_for_updates,
+            commands::check_native_update,
             commands::check_homebrew_installation,
             commands::check_appimage_installation,
             commands::brew_upgrade_cask,
@@ -658,6 +920,7 @@ pub fn run() {
             commands::should_check_updates,
             commands::update_last_check_time,
             commands::toggle_proxy_status,
+            commands::clear_account_forbidden,
             // Proxy service commands
             commands::proxy::start_proxy_service,
             commands::proxy::stop_proxy_service,
@@ -672,20 +935,29 @@ pub fn run() {
             commands::proxy::get_proxy_logs_count_filtered,
             commands::proxy::get_proxy_logs_filtered,
             commands::proxy::set_proxy_monitor_enabled,
+            commands::proxy::set_proxy_capture_health_logs,
             commands::proxy::clear_proxy_logs,
             commands::proxy::clear_thinking_store,
+            commands::proxy::get_signature_cache_stats,
+            commands::proxy::clear_signature_cache,
+            commands::proxy::get_thinking_store_count,
             commands::proxy::get_proxy_db_disk_size,
+            commands::proxy::test_model_connectivity,
             commands::proxy::generate_api_key,
             commands::proxy::reload_proxy_accounts,
             commands::proxy::update_model_mapping,
             commands::proxy::check_proxy_health,
             commands::proxy::get_proxy_pool_config,
-            commands::proxy::fetch_zai_models,
             commands::proxy::get_proxy_scheduling_config,
             commands::proxy::update_proxy_scheduling_config,
             commands::proxy::clear_proxy_session_bindings,
             commands::proxy::set_preferred_account,
             commands::proxy::get_preferred_account,
+            commands::proxy::get_hub_fingerprint,
+            commands::proxy::detect_remote_hub_fingerprint,
+            commands::proxy::check_hub_update,
+            commands::proxy::get_effective_first_byte_timeouts,
+            commands::proxy::get_effective_timeout_config,
             commands::proxy::clear_proxy_rate_limit,
             commands::proxy::clear_all_proxy_rate_limits,
             // Proxy Pool Binding commands
@@ -700,18 +972,24 @@ pub fn run() {
             commands::warm_up_all_accounts,
             commands::warm_up_account,
             commands::update_account_label,
+            commands::update_account_priority,
+            commands::update_account_project_id,
+            commands::auto_fetch_account_project_id,
             // HTTP API settings commands
             commands::get_http_api_settings,
             commands::save_http_api_settings,
             // Token 统计命令
+            commands::get_token_stats_minute,
             commands::get_token_stats_hourly,
             commands::get_token_stats_daily,
             commands::get_token_stats_weekly,
             commands::get_token_stats_by_account,
             commands::get_token_stats_summary,
             commands::get_token_stats_by_model,
+            commands::get_token_stats_model_trend_minute,
             commands::get_token_stats_model_trend_hourly,
             commands::get_token_stats_model_trend_daily,
+            commands::get_token_stats_account_trend_minute,
             commands::get_token_stats_account_trend_hourly,
             commands::get_token_stats_account_trend_daily,
             proxy::cli_sync::get_cli_sync_status,
@@ -727,6 +1005,16 @@ pub fn run() {
             proxy::opencode_sync::execute_opencode_restore,
             proxy::opencode_sync::get_opencode_config_content,
             proxy::opencode_sync::execute_opencode_clear,
+            proxy::hermes_sync::get_hermes_sync_status,
+            proxy::hermes_sync::execute_hermes_sync,
+            proxy::hermes_sync::execute_hermes_restore,
+            proxy::hermes_sync::execute_hermes_clear,
+            proxy::hermes_sync::get_hermes_config_content,
+            proxy::openclaw_sync::get_openclaw_sync_status,
+            proxy::openclaw_sync::execute_openclaw_sync,
+            proxy::openclaw_sync::execute_openclaw_restore,
+            proxy::openclaw_sync::execute_openclaw_clear,
+            proxy::openclaw_sync::get_openclaw_config_content,
             proxy::droid_sync::get_droid_sync_status,
             proxy::droid_sync::execute_droid_sync,
             proxy::droid_sync::execute_droid_restore,
@@ -768,17 +1056,45 @@ pub fn run() {
             commands::user_token::renew_user_token,
             commands::user_token::get_token_ip_bindings,
             commands::user_token::get_user_token_summary,
+            commands::user_token::get_user_token_stats,
+            commands::user_token::get_user_tokens_ranking,
             commands::query_transit_info,
             // Patch commands
             commands::patch_agy_binary,
+            commands::list_claude_installations,
+            commands::check_claude_cowork_patch,
+            commands::apply_claude_cowork_patch,
+            commands::revert_claude_cowork_patch,
+            commands::is_claude_desktop_running,
+            commands::close_claude_desktop,
+            commands::launch_claude_desktop,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
             match event {
+                tauri::RunEvent::Ready => {
+                    if modules::startup_quiet::take_lightweight_on_ready() {
+                        info!("Entering lightweight mode for quiet login launch");
+                        let _ = modules::lightweight::enter_lightweight_mode_without_saving(app_handle);
+                    }
+                }
+                // Prevent app from exiting when window is destroyed in lightweight mode
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    let tray_enabled = app_handle
+                        .try_state::<AppRuntimeFlags>()
+                        .map(|flags| flags.tray_enabled)
+                        .unwrap_or(true);
+
+                    if tray_enabled {
+                        api.prevent_exit();
+                    }
+                }
                 // Handle app exit - cleanup background tasks and release ports
                 tauri::RunEvent::Exit => {
                     tracing::info!("Application exiting, cleaning up background tasks and releasing ports...");
+                    // 尽力把签名缓存队列刷入 SQLite，避免直接退出丢失最近写入。
+                    crate::proxy::signature_cache::flush_on_exit();
                     if let Some(state) =
                         app_handle.try_state::<crate::commands::proxy::ProxyServiceState>()
                     {
@@ -813,16 +1129,28 @@ pub fn run() {
                 // Handle macOS dock icon click to reopen window
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Reopen { .. } => {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.unminimize();
-                        let _ = window.set_focus();
-                        app_handle
-                            .set_activation_policy(tauri::ActivationPolicy::Regular)
-                            .unwrap_or(());
-                    }
+                    let _ = modules::lightweight::exit_lightweight_mode(app_handle);
                 }
                 _ => {}
             }
         });
 }
+
+#[cfg(unix)]
+fn ensure_cli_symlinks() {
+    if let (Some(home), Ok(current_exe)) = (dirs::home_dir(), std::env::current_exe()) {
+        let local_bin = home.join(".local/bin");
+        if !local_bin.exists() {
+            let _ = std::fs::create_dir_all(&local_bin);
+        }
+        for name in &["antigravity-tools", "at"] {
+            let link = local_bin.join(name);
+            if !link.exists() {
+                let _ = std::os::unix::fs::symlink(&current_exe, &link);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_cli_symlinks() {}

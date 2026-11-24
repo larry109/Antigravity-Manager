@@ -3,7 +3,6 @@ use std::fs;
 
 use super::account::get_data_dir;
 use crate::models::AppConfig;
-use tracing::warn;
 
 const CONFIG_FILE: &str = "gui_config.json";
 
@@ -15,15 +14,46 @@ pub fn load_app_config() -> Result<AppConfig, String> {
     if !config_path.exists() {
         let config = AppConfig::new();
         // [FIX #1460] Persist initial config to prevent new API Key on every refresh
-        let _ = save_app_config(&config);
+        if let Err(e) = save_app_config(&config) {
+            tracing::warn!(
+                "Failed to persist initial config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still missing.",
+                config_path.display(),
+                e
+            );
+        }
         return Ok(config);
     }
 
     let content = fs::read_to_string(&config_path)
         .map_err(|e| format!("failed_to_read_config_file: {}", e))?;
 
-    let mut v: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("failed_to_parse_config_file: {}", e))?;
+    let (config, modified) = parse_and_migrate_config(&content)?;
+
+    // If migration occurred or empty config was generated, auto-save once to clean up the file
+    if modified {
+        if let Err(e) = save_app_config(&config) {
+            tracing::warn!(
+                "Failed to persist healed or migrated config to {}: {}. An in-memory config will be used; the next start may generate a new API key if the file is still empty.",
+                config_path.display(),
+                e
+            );
+        }
+    }
+
+    Ok(config)
+}
+
+/// Parse, migrate and normalize raw configuration JSON string.
+/// Returns (AppConfig, modified_flag).
+pub fn parse_and_migrate_config(content: &str) -> Result<(AppConfig, bool), String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        tracing::warn!("Configuration content is empty, generating default configuration");
+        return Ok((AppConfig::new(), true));
+    }
+
+    let mut v: serde_json::Value =
+        serde_json::from_str(trimmed).map_err(|e| format!("failed_to_parse_config_file: {}", e))?;
 
     let mut modified = false;
 
@@ -79,7 +109,133 @@ pub fn load_app_config() -> Result<AppConfig, String> {
             modified = true;
         }
 
-        // Migrate log retention max_disk_mb: if 0, smoothly recover to 1024 MiB default
+        // 旧版启动时注入的精确映射会挡住 3.x Flash 裸模型的档位路由。
+        // 只删除仍等于当时默认值的条目；用户改过的目标保留。
+        for (k, old_default) in [
+            ("gemini-3.6-flash", "gemini-3.6-flash-tiered"),
+            ("gemini-3.7-flash", "gemini-3.7-flash-tiered"),
+            ("gemini-3.8-flash", "gemini-3.8-flash-tiered"),
+        ] {
+            if custom_mapping.get(k).and_then(|v| v.as_str()) == Some(old_default) {
+                custom_mapping.remove(k);
+                modified = true;
+            }
+        }
+
+        // 清理已废弃的旧内置规则 gemini-3.x-flash（已由纯数据驱动 DynamicTierRouter 取代）
+        if custom_mapping.contains_key("gemini-3.x-flash") {
+            custom_mapping.remove("gemini-3.x-flash");
+            modified = true;
+        }
+
+        // 检查 builtin_mapping_version 并进行内置自适应暗路由规则版本迁移 (防复活保障)
+        let builtin_version = proxy
+            .get("builtin_mapping_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let mut custom_mapping_expose = match proxy.get("custom_mapping_expose") {
+            Some(m) if m.is_object() => m.as_object().unwrap().clone(),
+            _ => serde_json::Map::new(),
+        };
+
+        if builtin_version < 1 {
+            // 首次升级至版本 1：注入 3 条自适应暗路由规则（默认 expose: false）
+            let builtins = [
+                ("claude-fable-*", "auto:claude-opus", false),
+                ("claude-opus-4-7*", "auto:claude-opus-4-7", false),
+                ("claude-haiku-*", "auto:gemini-flash-low", false),
+            ];
+            for (pattern, target, expose) in builtins {
+                if !custom_mapping.contains_key(pattern) {
+                    custom_mapping.insert(
+                        pattern.to_string(),
+                        serde_json::Value::String(target.to_string()),
+                    );
+                }
+                if !custom_mapping_expose.contains_key(pattern) {
+                    custom_mapping_expose
+                        .insert(pattern.to_string(), serde_json::Value::Bool(expose));
+                }
+            }
+            // 存量自定义映射如果未显式声明 expose，通配与自适应规则默认 false，精确自定义规则默认 true
+            for (k, v) in custom_mapping.iter() {
+                if !custom_mapping_expose.contains_key(k) {
+                    let is_auto = v.as_str().map_or(false, |s| s.starts_with("auto:"));
+                    let default_exp = !k.contains('*') && !is_auto;
+                    custom_mapping_expose.insert(k.clone(), serde_json::Value::Bool(default_exp));
+                }
+            }
+            proxy.as_object_mut().unwrap().insert(
+                "builtin_mapping_version".to_string(),
+                serde_json::Value::Number(1.into()),
+            );
+            proxy.as_object_mut().unwrap().insert(
+                "custom_mapping_expose".to_string(),
+                serde_json::Value::Object(custom_mapping_expose.clone()),
+            );
+            modified = true;
+        }
+
+        // 旧出厂默认 flash_high = 16384 或 32768。只在首次启动且模式为 default 时改成官方 -1。
+        if let Some(tb) = proxy
+            .get_mut("thinking_budget")
+            .and_then(|t| t.as_object_mut())
+        {
+            let migrated_32k = tb
+                .get("thinking_budget_32k_legacy_migrated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !migrated_32k {
+                let flash_mode_is_default = tb
+                    .get("flash_mode")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("default"))
+                    .unwrap_or(false);
+                let pro_mode_is_default = tb
+                    .get("pro_mode")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case("default"))
+                    .unwrap_or(false);
+
+                if flash_mode_is_default {
+                    if let Some(val) = tb.get("flash_high").and_then(|v| v.as_i64()) {
+                        if val == 16384 || val == 32768 {
+                            tb.insert("flash_high".to_string(), serde_json::Value::from(-1));
+                        }
+                    }
+                }
+
+                if pro_mode_is_default {
+                    if let Some(val) = tb.get("pro_high").and_then(|v| v.as_i64()) {
+                        if val == 32768 {
+                            tb.insert("pro_high".to_string(), serde_json::Value::from(-1));
+                        }
+                    }
+                }
+
+                tb.insert(
+                    "thinking_budget_32k_legacy_migrated".to_string(),
+                    serde_json::Value::from(true),
+                );
+                modified = true;
+            }
+
+            let migrated = tb
+                .get("flash_high_legacy_migrated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !migrated {
+                if tb.get("flash_high").and_then(|v| v.as_i64()) == Some(16384) {
+                    tb.insert("flash_high".to_string(), serde_json::Value::from(-1));
+                }
+                tb.insert(
+                    "flash_high_legacy_migrated".to_string(),
+                    serde_json::Value::from(true),
+                );
+                modified = true;
+            }
+        }
         if let Some(log_retention) = proxy
             .get_mut("log_retention")
             .and_then(|m| m.as_object_mut())
@@ -113,6 +269,38 @@ pub fn load_app_config() -> Result<AppConfig, String> {
             }
         }
 
+        // [2026-10-29] 思考控制权已收敛为「网关 + 自适应」：
+        // 旧配置中的 client（客户端直控）统一迁移回 gateway，避免 UI 显示已不存在的模式。
+        if let Some(tb) = proxy
+            .get_mut("thinking_budget")
+            .and_then(|t| t.as_object_mut())
+        {
+            if tb.get("control_source").and_then(|v| v.as_str()) == Some("client") {
+                tb.insert(
+                    "control_source".to_string(),
+                    serde_json::Value::String("gateway".to_string()),
+                );
+                tracing::info!(
+                    "Migrating thinking_budget.control_source: client -> gateway (client control mode removed)"
+                );
+                modified = true;
+            }
+        }
+
+        // 自动迁移/初始化 prompt_rewrite 配置：若旧配置中缺失该字段，则注入默认开启并搭载官方推荐预设
+        if let Some(proxy_obj) = proxy.as_object_mut() {
+            if !proxy_obj.contains_key("prompt_rewrite") {
+                let default_prompt_rewrite =
+                    serde_json::to_value(crate::proxy::config::PromptRewriteConfig::default())
+                        .unwrap_or(serde_json::Value::Null);
+                if !default_prompt_rewrite.is_null() {
+                    proxy_obj.insert("prompt_rewrite".to_string(), default_prompt_rewrite);
+                    tracing::info!("Initializing default prompt_rewrite config (enabled with recommended presets)");
+                    modified = true;
+                }
+            }
+        }
+
         if modified {
             proxy.as_object_mut().unwrap().insert(
                 "custom_mapping".to_string(),
@@ -124,12 +312,7 @@ pub fn load_app_config() -> Result<AppConfig, String> {
     let config: AppConfig = serde_json::from_value(v)
         .map_err(|e| format!("failed_to_convert_config_after_migration: {}", e))?;
 
-    // If migration occurred, auto-save once to clean up the file
-    if modified {
-        let _ = save_app_config(&config);
-    }
-
-    Ok(config)
+    Ok((config, modified))
 }
 
 /// Save application configuration (atomic write)
@@ -142,4 +325,35 @@ pub fn save_app_config(config: &AppConfig) -> Result<(), String> {
 
     crate::utils::fs::write_atomic(&config_path, content.as_bytes())
         .map_err(|e| format!("failed_to_save_config: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_and_migrate_empty_or_whitespace_config() {
+        // [FIX #3548] Ensure empty or whitespace-only config file does not trigger EOF error in headless mode
+        let (empty_cfg, modified_empty) =
+            parse_and_migrate_config("").expect("empty config should parse to default");
+        assert!(modified_empty);
+        assert!(!empty_cfg.proxy.api_key.is_empty());
+
+        let (ws_cfg, modified_ws) = parse_and_migrate_config("   \n\t  \r\n  ")
+            .expect("whitespace config should parse to default");
+        assert!(modified_ws);
+        assert!(!ws_cfg.proxy.api_key.is_empty());
+    }
+
+    #[test]
+    fn test_parse_and_migrate_valid_and_invalid_json() {
+        let invalid = parse_and_migrate_config("{ invalid_json: ");
+        assert!(invalid.is_err());
+        assert!(invalid.unwrap_err().contains("failed_to_parse_config_file"));
+
+        let default_json = serde_json::to_string(&AppConfig::new()).unwrap();
+        let (valid_cfg, _) =
+            parse_and_migrate_config(&default_json).expect("valid config should parse");
+        assert!(!valid_cfg.proxy.api_key.is_empty());
+    }
 }

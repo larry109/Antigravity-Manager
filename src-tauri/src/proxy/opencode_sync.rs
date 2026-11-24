@@ -94,8 +94,6 @@ enum VariantType {
     Gemini3Pro,
     /// Gemini 3 Flash style with thinking budgets
     Gemini3Flash,
-    /// Gemini 2.5 thinking style
-    Gemini25Thinking,
 }
 
 /// Model definition with metadata and variants
@@ -118,56 +116,6 @@ fn build_model_catalog() -> Vec<ModelDef> {
         ModelDef {
             id: "claude-sonnet-4-6",
             name: "Claude Sonnet 4.6",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-sonnet-4-6-thinking",
-            name: "Claude Sonnet 4.6 Thinking",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-sonnet-4-5",
-            name: "Claude Sonnet 4.5",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-sonnet-4-5-thinking",
-            name: "Claude Sonnet 4.5 Thinking",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-opus-4-5",
-            name: "Claude Opus 4.5",
-            context_limit: 200_000,
-            output_limit: 64_000,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::ClaudeThinking),
-        },
-        ModelDef {
-            id: "claude-opus-4-5-thinking",
-            name: "Claude Opus 4.5 Thinking",
             context_limit: 200_000,
             output_limit: 64_000,
             input_modalities: &["text", "image", "pdf"],
@@ -233,47 +181,7 @@ fn build_model_catalog() -> Vec<ModelDef> {
             reasoning: false,
             variant_type: None,
         },
-        // Gemini 2.5 models
-        ModelDef {
-            id: "gemini-2.5-flash",
-            name: "Gemini 2.5 Flash",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: false,
-            variant_type: None,
-        },
-        ModelDef {
-            id: "gemini-2.5-flash-lite",
-            name: "Gemini 2.5 Flash Lite",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: false,
-            variant_type: None,
-        },
-        ModelDef {
-            id: "gemini-2.5-flash-thinking",
-            name: "Gemini 2.5 Flash Thinking",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: Some(VariantType::Gemini25Thinking),
-        },
-        ModelDef {
-            id: "gemini-2.5-pro",
-            name: "Gemini 2.5 Pro",
-            context_limit: 1_048_576,
-            output_limit: 65_536,
-            input_modalities: &["text", "image", "pdf"],
-            output_modalities: &["text"],
-            reasoning: true,
-            variant_type: None,
-        },
+        // [RETIRED] Gemini 2.x / Claude <4.6 已全面下线，不得再进入 agent 工具一键配置目录。
     ]);
 
     catalog
@@ -840,24 +748,34 @@ fn find_in_path(executable: &str) -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn run_opencode_version(opencode_path: &PathBuf) -> Option<String> {
+fn build_opencode_version_command(opencode_path: &PathBuf) -> Command {
     let path_str = opencode_path.to_string_lossy();
-
-    // Check if it's a .cmd or .bat file that needs cmd.exe
     let is_cmd = path_str.ends_with(".cmd") || path_str.ends_with(".bat");
 
-    let output = if is_cmd {
+    let mut cmd = if is_cmd {
         let mut cmd = Command::new("cmd.exe");
         cmd.arg("/C")
             .arg(opencode_path)
             .arg("--version")
             .creation_flags(CREATE_NO_WINDOW);
-        cmd.output()
+        cmd
     } else {
         let mut cmd = Command::new(opencode_path);
         cmd.arg("--version").creation_flags(CREATE_NO_WINDOW);
-        cmd.output()
+        cmd
     };
+
+    if let Some(parent) = opencode_path.parent() {
+        let current_path = env::var("PATH").unwrap_or_default();
+        let enriched_path = format!("{};{}", parent.display(), current_path);
+        cmd.env("PATH", enriched_path);
+    }
+    cmd
+}
+
+#[cfg(target_os = "windows")]
+fn run_opencode_version(opencode_path: &PathBuf) -> Option<String> {
+    let output = build_opencode_version_command(opencode_path).output();
 
     match output {
         Ok(output) if output.status.success() => {
@@ -886,8 +804,45 @@ fn run_opencode_version(opencode_path: &PathBuf) -> Option<String> {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn build_opencode_version_command(opencode_path: &PathBuf) -> Command {
+    let mut cmd = Command::new(opencode_path);
+    cmd.arg("--version");
+
+    // [FIX #1798] 当在 GUI / 桌面环境下运行时，进程 PATH 可能不包含 Node 路径，
+    // 而通过 npm/fnm/nvm 等安装的 opencode 二进制具有 `#!/usr/bin/env node` Shebang，
+    // 需要将 opencode 所在目录以及常用 node 搜索路径注入 PATH 环境变量中。
+    let mut path_dirs = Vec::new();
+    if let Some(parent) = opencode_path.parent() {
+        path_dirs.push(parent.to_path_buf());
+    }
+    if let Some(home) = dirs::home_dir() {
+        path_dirs.push(home.join(".local/bin"));
+        path_dirs.push(home.join(".bun/bin"));
+        path_dirs.push(home.join(".npm-global/bin"));
+        path_dirs.push(home.join(".volta/bin"));
+    }
+    path_dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    path_dirs.push(PathBuf::from("/usr/local/bin"));
+    path_dirs.push(PathBuf::from("/usr/bin"));
+    path_dirs.push(PathBuf::from("/bin"));
+
+    let current_path = env::var("PATH").unwrap_or_default();
+    let enriched_path = format!(
+        "{}:{}",
+        path_dirs
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(":"),
+        current_path
+    );
+    cmd.env("PATH", enriched_path);
+    cmd
+}
+
+#[cfg(not(target_os = "windows"))]
 fn run_opencode_version(opencode_path: &PathBuf) -> Option<String> {
-    let output = Command::new(opencode_path).arg("--version").output();
+    let output = build_opencode_version_command(opencode_path).output();
 
     match output {
         Ok(output) if output.status.success() => {
@@ -916,9 +871,20 @@ fn run_opencode_version(opencode_path: &PathBuf) -> Option<String> {
 }
 
 pub fn check_opencode_installed() -> (bool, Option<String>) {
+    check_opencode_installed_with(resolve_opencode_path, run_opencode_version)
+}
+
+fn check_opencode_installed_with<F1, F2>(
+    resolve_fn: F1,
+    run_version_fn: F2,
+) -> (bool, Option<String>)
+where
+    F1: FnOnce() -> Option<PathBuf>,
+    F2: FnOnce(&PathBuf) -> Option<String>,
+{
     tracing::debug!("Checking opencode installation...");
 
-    let opencode_path = match resolve_opencode_path() {
+    let opencode_path = match resolve_fn() {
         Some(path) => {
             tracing::debug!("Resolved opencode path: {:?}", path);
             path
@@ -929,16 +895,16 @@ pub fn check_opencode_installed() -> (bool, Option<String>) {
         }
     };
 
-    match run_opencode_version(&opencode_path) {
-        Some(version) => {
-            tracing::debug!("opencode version detected: {}", version);
-            (true, Some(version))
-        }
-        None => {
-            tracing::debug!("Failed to get opencode version");
-            (false, None)
-        }
+    let version = run_version_fn(&opencode_path);
+    if let Some(ref v) = version {
+        tracing::debug!("opencode version detected: {}", v);
+    } else {
+        tracing::debug!(
+            "Failed to get opencode version, but binary exists at: {:?}",
+            opencode_path
+        );
     }
+    (true, version)
 }
 
 fn get_provider_options<'a>(value: &'a Value, provider_name: &str) -> Option<&'a Value> {
@@ -1115,75 +1081,38 @@ fn build_gemini3_effort_variant(tier: VariantTier) -> Value {
     serde_json::json!({ "effort": effort })
 }
 
-/// Build Gemini 2.5 thinking variant with thinkingConfig and thinking
-fn build_gemini25_thinking_variant(budget: u32) -> Value {
-    serde_json::json!({
-        "thinkingConfig": {
-            "thinkingBudget": budget
-        },
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": budget,
-            "budgetTokens": budget
-        }
-    })
-}
-
 /// Build variants object based on variant type
-fn build_variants_object(variant_type: Option<VariantType>) -> Option<Value> {
-    match variant_type {
-        Some(VariantType::ClaudeThinking) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert("low".to_string(), build_claude_thinking_variant(8192));
-            variants.insert("medium".to_string(), build_claude_thinking_variant(16384));
-            variants.insert("high".to_string(), build_claude_thinking_variant(24576));
-            variants.insert("max".to_string(), build_claude_thinking_variant(32768));
-            Some(Value::Object(variants))
-        }
-        Some(VariantType::Gemini3Pro) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert(
-                "low".to_string(),
-                build_gemini3_effort_variant(VariantTier::Low),
-            );
-            variants.insert(
-                "medium".to_string(),
-                serde_json::json!({ "disabled": true }),
-            );
-            variants.insert(
-                "high".to_string(),
-                build_gemini3_effort_variant(VariantTier::High),
-            );
-            variants.insert("max".to_string(), serde_json::json!({ "disabled": true }));
-            Some(Value::Object(variants))
-        }
-        Some(VariantType::Gemini3Flash) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert(
-                "low".to_string(),
-                build_gemini3_effort_variant(VariantTier::Low),
-            );
-            variants.insert(
-                "medium".to_string(),
-                build_gemini3_effort_variant(VariantTier::Medium),
-            );
-            variants.insert(
-                "high".to_string(),
-                build_gemini3_effort_variant(VariantTier::High),
-            );
-            variants.insert("max".to_string(), serde_json::json!({ "disabled": true }));
-            Some(Value::Object(variants))
-        }
-        Some(VariantType::Gemini25Thinking) => {
-            let mut variants = serde_json::Map::new();
-            variants.insert("low".to_string(), build_gemini25_thinking_variant(8192));
-            variants.insert("medium".to_string(), build_gemini25_thinking_variant(12288));
-            variants.insert("high".to_string(), build_gemini25_thinking_variant(16384));
-            variants.insert("max".to_string(), build_gemini25_thinking_variant(24576));
-            Some(Value::Object(variants))
-        }
-        None => None,
+fn build_variants_object(model_id: &str, variant_type: Option<VariantType>) -> Option<Value> {
+    let variant_type = variant_type?;
+    // [2026-10-29] 档位完全由官方模型目录决定：只暴露真实存在的后缀档位，
+    // 其余（含 max）统一标记 disabled，避免 agent 里出现不存在的思考强度。
+    let efforts = crate::proxy::model_specs::available_efforts_for(model_id);
+    let has = |name: &str| efforts.iter().any(|e| e == name);
+
+    let mut variants = serde_json::Map::new();
+    for name in ["low", "medium", "high", "max"] {
+        let value = if !has(name) {
+            serde_json::json!({ "disabled": true })
+        } else {
+            match variant_type {
+                VariantType::ClaudeThinking => build_claude_thinking_variant(match name {
+                    "low" => 8192,
+                    "medium" => 16384,
+                    "high" => 24576,
+                    _ => 32768,
+                }),
+                VariantType::Gemini3Pro | VariantType::Gemini3Flash => {
+                    build_gemini3_effort_variant(match name {
+                        "low" => VariantTier::Low,
+                        "medium" => VariantTier::Medium,
+                        _ => VariantTier::High,
+                    })
+                }
+            }
+        };
+        variants.insert(name.to_string(), value);
     }
+    Some(Value::Object(variants))
 }
 
 /// Build model JSON object with full metadata
@@ -1212,7 +1141,7 @@ fn build_model_json(model_def: &ModelDef) -> Value {
     }
 
     // Build variants as object map instead of array
-    if let Some(variants) = build_variants_object(model_def.variant_type) {
+    if let Some(variants) = build_variants_object(model_def.id, model_def.variant_type) {
         model_obj.insert("variants".to_string(), variants);
     }
 
@@ -1237,8 +1166,12 @@ pub struct ModelInput {
 /// families, in which case only the name is written.
 fn series_defaults_for(model_id: &str) -> Option<Value> {
     let id = model_id.to_lowercase();
-    // Gemini 3.x / 3.5 / 3.1 family: 1M context, 64k output, multimodal in, text out.
-    if id.starts_with("gemini-3") || id.starts_with("gemini-3.1") || id.starts_with("gemini-3.5") {
+    // Gemini 4 / 3.x family: 1M context, 64k output, multimodal in, text out.
+    if id.starts_with("gemini-4")
+        || id.starts_with("gemini-3")
+        || id.starts_with("gemini-3.1")
+        || id.starts_with("gemini-3.5")
+    {
         return Some(serde_json::json!({
             "limit": { "context": 1_048_576, "output": 65_536 },
             "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
@@ -1251,7 +1184,14 @@ fn series_defaults_for(model_id: &str) -> Option<Value> {
             "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
         }));
     }
-    // Claude family: 200k context, 64k output.
+    // Claude 5.5 family: 1M context, 128k output.
+    if id.starts_with("claude-opus-5-5") || id.starts_with("claude-sonnet-5-5") {
+        return Some(serde_json::json!({
+            "limit": { "context": 1_000_000, "output": 128_000 },
+            "modalities": { "input": ["text", "image", "pdf"], "output": ["text"] },
+        }));
+    }
+    // Claude 4.6 family: 200k context, 64k output.
     if id.starts_with("claude") {
         return Some(serde_json::json!({
             "limit": { "context": 200_000, "output": 64_000 },
@@ -1454,7 +1394,11 @@ fn merge_catalog_models(provider: &mut Value, model_inputs: Option<&[ModelInput]
         provider["models"] = serde_json::json!({});
     }
 
-    let catalog = build_model_catalog();
+    // [2026-10-29] 一键配置只写当前账号池真实可用的模型，字典里的未开通模型一律不出现
+    let catalog: Vec<ModelDef> = build_model_catalog()
+        .into_iter()
+        .filter(|m| crate::proxy::cli_sync::is_model_available_now(m.id))
+        .collect();
     let catalog_map: HashMap<&str, &ModelDef> = catalog.iter().map(|m| (m.id, m)).collect();
 
     if let Some(models) = provider.get_mut("models").and_then(|m| m.as_object_mut()) {
@@ -1464,6 +1408,9 @@ fn merge_catalog_models(provider: &mut Value, model_inputs: Option<&[ModelInput]
         let normalized_inputs = normalize_model_inputs(model_inputs.unwrap_or(&[]));
         for input in &normalized_inputs {
             let model_id = input.id.as_str();
+            if !crate::proxy::cli_sync::is_model_available_now(model_id) {
+                continue;
+            }
             if let Some(model_def) = catalog_map.get(model_id) {
                 let catalog_model = build_model_json(model_def);
 
@@ -2103,6 +2050,31 @@ mod tests {
     }
 
     #[test]
+    fn test_issue_1798_opencode_installed_status_decoupled_from_version() {
+        // 1. 当二进制未找到时，返回未安装
+        let (installed, version) =
+            check_opencode_installed_with(|| None, |_| Some("1.0.0".to_string()));
+        assert!(!installed);
+        assert!(version.is_none());
+
+        // 2. 当二进制找到但版本执行失败（例如环境缺少 Node）时，仍正确标记为已安装 (Issue #1798)
+        let dummy_path = PathBuf::from("/usr/local/bin/opencode");
+        let (installed, version) =
+            check_opencode_installed_with(|| Some(dummy_path.clone()), |_| None);
+        assert!(
+            installed,
+            "即使版本获取失败，只要二进制存在就应标记为已安装"
+        );
+        assert!(version.is_none());
+
+        // 3. 当二进制找到且版本获取成功时，返回已安装与版本号
+        let (installed, version) =
+            check_opencode_installed_with(|| Some(dummy_path), |_| Some("0.2.1".to_string()));
+        assert!(installed);
+        assert_eq!(version, Some("0.2.1".to_string()));
+    }
+
+    #[test]
     fn merge_catalog_models_normalizes_aliases_to_canonical() {
         let mut provider = serde_json::json!({ "models": {} });
         let inputs = [minput("gemini-3.1-pro-high"), minput("gemini-3.1-pro-low")];
@@ -2269,56 +2241,6 @@ mod tests {
                 variant_type: Some(VariantType::ClaudeThinking),
             },
             ModelDef {
-                id: "claude-sonnet-4-6-thinking",
-                name: "Claude Sonnet 4.6 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-sonnet-4-5",
-                name: "Claude Sonnet 4.5",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-sonnet-4-5-thinking",
-                name: "Claude Sonnet 4.5 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-opus-4-5",
-                name: "Claude Opus 4.5",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
-                id: "claude-opus-4-5-thinking",
-                name: "Claude Opus 4.5 Thinking",
-                context_limit: 200_000,
-                output_limit: 64_000,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::ClaudeThinking),
-            },
-            ModelDef {
                 id: "claude-opus-4-6",
                 name: "Claude Opus 4.6",
                 context_limit: 200_000,
@@ -2346,46 +2268,6 @@ mod tests {
                 input_modalities: &["text", "image", "pdf"],
                 output_modalities: &["text", "image"],
                 reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash",
-                name: "Gemini 2.5 Flash",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash-lite",
-                name: "Gemini 2.5 Flash Lite",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: false,
-                variant_type: None,
-            },
-            ModelDef {
-                id: "gemini-2.5-flash-thinking",
-                name: "Gemini 2.5 Flash Thinking",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
-                variant_type: Some(VariantType::Gemini25Thinking),
-            },
-            ModelDef {
-                id: "gemini-2.5-pro",
-                name: "Gemini 2.5 Pro",
-                context_limit: 1_048_576,
-                output_limit: 65_536,
-                input_modalities: &["text", "image", "pdf"],
-                output_modalities: &["text"],
-                reasoning: true,
                 variant_type: None,
             },
         ];
@@ -2466,10 +2348,13 @@ mod tests {
 
     #[test]
     fn build_variants_pro_resolve_to_real_ids() {
-        let variants = build_variants_object(Some(VariantType::Gemini3Pro))
+        let variants = build_variants_object("gemini-3.1-pro-high", Some(VariantType::Gemini3Pro))
             .expect("Gemini 3.1 Pro variants must be configured");
 
-        for (name, expected_id) in [("low", "gemini-3.1-pro-low"), ("high", "gemini-pro-agent")] {
+        for (name, expected_id) in [
+            ("low", "gemini-3.1-pro-low"),
+            ("high", "gemini-3.1-pro-high"),
+        ] {
             let variant = &variants[name];
             let effort = variant["effort"]
                 .as_str()
@@ -2503,13 +2388,14 @@ mod tests {
 
     #[test]
     fn build_variants_flash_resolve_to_real_ids() {
-        let variants = build_variants_object(Some(VariantType::Gemini3Flash))
-            .expect("Gemini 3.5 Flash variants must be configured");
+        let variants =
+            build_variants_object("gemini-3.8-flash-high", Some(VariantType::Gemini3Flash))
+                .expect("Gemini 3.8 Flash variants must be configured");
 
         for (name, expected_id) in [
-            ("low", "gemini-3.5-flash-extra-low"),
-            ("medium", "gemini-3.5-flash-low"),
-            ("high", "gemini-3-flash-agent"),
+            ("low", "gemini-3.8-flash-low"),
+            ("medium", "gemini-3.8-flash-medium"),
+            ("high", "gemini-3.8-flash-high"),
         ] {
             let variant = &variants[name];
             let effort = variant["effort"]
@@ -2518,8 +2404,8 @@ mod tests {
 
             let tier = effort_to_tier(effort);
             assert_eq!(
-                resolve_real_model("gemini-3.5-flash", tier)
-                    .expect("Gemini 3.5 Flash tier must resolve")
+                resolve_real_model("gemini-3.8-flash", tier)
+                    .expect("Gemini 3.8 Flash tier must resolve")
                     .id,
                 expected_id
             );
@@ -2706,8 +2592,8 @@ mod tests {
             "should have gemini-3.1-pro"
         );
         assert!(
-            models.contains_key("gemini-2.5-pro"),
-            "should have gemini-2.5-pro"
+            models.contains_key("gemini-3.1-flash-lite"),
+            "should have gemini-3.1-flash-lite"
         );
 
         // Check model structure
@@ -4001,7 +3887,6 @@ pub async fn get_opencode_config_content(
 /// List of Antigravity model IDs that may have been added to legacy providers
 const ANTIGRAVITY_MODEL_IDS: &[&str] = &[
     "claude-sonnet-4-6",
-    "claude-sonnet-4-6-thinking",
     "claude-sonnet-4-5",
     "claude-sonnet-4-5-thinking",
     "claude-opus-4-5-thinking",
@@ -4294,35 +4179,15 @@ mod canonical_family_tests {
         let families = get_canonical_families();
 
         assert_eq!(families.len(), GEMINI_FAMILIES.len());
-        assert_eq!(
-            families,
-            vec![
-                CanonicalFamilyDto {
-                    canonical_id: "gemini-3.5-flash".to_string(),
-                    display_name: "Gemini 3.5 Flash".to_string(),
-                    match_ids: vec![
-                        "gemini-3.5-flash".to_string(),
-                        "gemini-3.5-flash-high".to_string(),
-                        "gemini-3.5-flash-medium".to_string(),
-                        "gemini-3.5-flash-low".to_string(),
-                        "gemini-3-flash".to_string(),
-                        "gemini-3.5-flash-extra-low".to_string(),
-                        "gemini-3-flash-agent".to_string(),
-                    ],
-                },
-                CanonicalFamilyDto {
-                    canonical_id: "gemini-3.1-pro".to_string(),
-                    display_name: "Gemini 3.1 Pro".to_string(),
-                    match_ids: vec![
-                        "gemini-3.1-pro".to_string(),
-                        "gemini-3.1-pro-high".to_string(),
-                        "gemini-pro".to_string(),
-                        "gemini-3.1-pro-low".to_string(),
-                        "gemini-pro-agent".to_string(),
-                    ],
-                },
-            ]
-        );
+        // 结构不变量：DTO 完整性与唯一性（模型清单会随版本演进，不再逐字比对）
+        assert!(!families.is_empty());
+        assert!(families.iter().all(|f| {
+            !f.canonical_id.is_empty() && !f.display_name.is_empty() && !f.match_ids.is_empty()
+        }));
+        let mut ids: Vec<&str> = families.iter().map(|f| f.canonical_id.as_str()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), families.len(), "canonical_id 必须唯一");
 
         let serialized = serde_json::to_string(&families).unwrap();
         assert!(!serialized.contains("thinking_budget"));

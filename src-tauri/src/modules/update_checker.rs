@@ -5,12 +5,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const GITHUB_API_URL: &str =
     "https://api.github.com/repos/lbjlaq/Antigravity-Manager/releases/latest";
+const GITHUB_RELEASES_API_URL: &str =
+    "https://api.github.com/repos/lbjlaq/Antigravity-Manager/releases?per_page=15";
 const GITHUB_RAW_URL: &str =
     "https://raw.githubusercontent.com/lbjlaq/Antigravity-Manager/main/package.json";
 const JSDELIVR_URL: &str =
     "https://cdn.jsdelivr.net/gh/lbjlaq/Antigravity-Manager@main/package.json";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CHECK_INTERVAL_HOURS: u64 = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateChannel {
+    Stable,
+    Beta,
+}
+
+impl Default for UpdateChannel {
+    fn default() -> Self {
+        if CURRENT_VERSION.contains('-') {
+            UpdateChannel::Beta
+        } else {
+            UpdateChannel::Stable
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateInfo {
@@ -24,6 +43,10 @@ pub struct UpdateInfo {
     pub source: Option<String>,
     #[serde(default)]
     pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub channel: Option<UpdateChannel>,
+    #[serde(default)]
+    pub updater_json_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +55,8 @@ pub struct UpdateSettings {
     pub last_check_time: u64,
     #[serde(default = "default_check_interval")]
     pub check_interval_hours: u64,
+    #[serde(default)]
+    pub update_channel: UpdateChannel,
 }
 
 fn default_check_interval() -> u64 {
@@ -44,6 +69,52 @@ impl Default for UpdateSettings {
             auto_check: true,
             last_check_time: 0,
             check_interval_hours: DEFAULT_CHECK_INTERVAL_HOURS,
+            update_channel: UpdateChannel::default(),
+        }
+    }
+}
+
+/// 更新设置的局部补丁：仅覆盖显式提供的字段，未提供的字段保留磁盘上的现有值。
+///
+/// 该结构同时服务于 Web (Axum) 与桌面 (Tauri) 两条链路：
+/// - Web 前端 `invoke('save_update_settings', { settings: { ... } })` 经 HTTP 原样透传；
+/// - 桌面端由 Tauri 按参数名 `settings` 自动解包。
+///
+/// 直接用完整结构体落盘会带来两个历史问题：前端硬编码的 `last_check_time: 0`
+/// 会清空最近检查时间并触发立即检查；部分调用点省略的 `update_channel` 会因
+/// `#[serde(default)]` 被静默重置为构建默认通道。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct UpdateSettingsPatch {
+    pub auto_check: Option<bool>,
+    pub last_check_time: Option<u64>,
+    pub check_interval_hours: Option<u64>,
+    pub update_channel: Option<UpdateChannel>,
+}
+
+impl UpdateSettingsPatch {
+    /// 补丁未携带任何字段时视为无效请求，避免静默返回成功。
+    pub fn is_empty(&self) -> bool {
+        self.auto_check.is_none()
+            && self.last_check_time.is_none()
+            && self.check_interval_hours.is_none()
+            && self.update_channel.is_none()
+    }
+}
+
+impl UpdateSettings {
+    /// 将补丁字段合并进当前设置，未提供的字段保持不变。
+    pub fn apply_patch(&mut self, patch: UpdateSettingsPatch) {
+        if let Some(auto_check) = patch.auto_check {
+            self.auto_check = auto_check;
+        }
+        if let Some(last_check_time) = patch.last_check_time {
+            self.last_check_time = last_check_time;
+        }
+        if let Some(check_interval_hours) = patch.check_interval_hours {
+            self.check_interval_hours = check_interval_hours;
+        }
+        if let Some(update_channel) = patch.update_channel {
+            self.update_channel = update_channel;
         }
     }
 }
@@ -52,12 +123,24 @@ impl Default for UpdateSettings {
 struct GitHubRelease {
     tag_name: String,
     html_url: String,
-    body: String,
-    published_at: String,
+    body: Option<String>,
+    published_at: Option<String>,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
 }
 
-const UPDATER_JSON_URL: &str =
+#[derive(Debug, Deserialize)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+pub const STABLE_UPDATER_JSON_URL: &str =
     "https://github.com/lbjlaq/Antigravity-Manager/releases/latest/download/updater.json";
+pub const PREVIEW_UPDATER_JSON_URL: &str =
+    "https://github.com/lbjlaq/Antigravity-Manager/releases/download/preview/updater.json";
 
 pub fn get_upstream_proxy_url() -> Option<String> {
     if let Ok(config) = crate::modules::config::load_app_config() {
@@ -99,72 +182,58 @@ pub fn get_upstream_proxy_url() -> Option<String> {
 }
 
 /// Check for updates with improved strategy:
-/// 1. Check updater.json (Source of Truth for Auto-Update)
-/// 2. Fallback to GitHub API (Informational)
+/// 1. Check updater.json based on selected channel (Stable vs Beta)
+/// 2. Fallback to GitHub API (Release or Pre-release)
 pub async fn check_for_updates() -> Result<UpdateInfo, String> {
-    let mut info = check_for_updates_internal().await?;
+    let settings = load_update_settings().unwrap_or_default();
+    check_for_updates_with_channel(settings.update_channel).await
+}
+
+/// Check for updates for an explicit channel (allows instant channel switching verification)
+pub async fn check_for_updates_with_channel(channel: UpdateChannel) -> Result<UpdateInfo, String> {
+    let mut info = check_for_updates_internal(channel).await?;
     info.proxy_url = get_upstream_proxy_url();
+    info.channel = Some(channel);
     Ok(info)
 }
 
-async fn check_for_updates_internal() -> Result<UpdateInfo, String> {
+async fn check_for_updates_internal(channel: UpdateChannel) -> Result<UpdateInfo, String> {
     // 1. Try updater.json first (Critical for functional Auto-Update)
-    match check_updater_json().await {
+    match check_updater_json_channel(channel).await {
         Ok(info) => return Ok(info),
         Err(e) => {
             logger::log_warn(&format!(
-                "updater.json check failed: {}. This might mean artifacts are not ready yet.",
-                e
+                "{:?} updater.json check failed: {}. Trying fallbacks...",
+                channel, e
             ));
-            // Don't return error immediately, try fallbacks for at least informational update
         }
     }
 
     // 2. Try GitHub API
-    match check_github_api().await {
-        Ok(info) => {
-            // If we found an update via API but updater.json failed, we should probably warn or
-            // implies that auto-update won't work yet.
-            // However, the user wants "auto-update to work". If we show "Update Available" based on API
-            // but updater.json is missing, the "Auto Update" button will fail.
-            // So, ideally, if we are in this block, we should perhaps mark it as "Manual Download Only" or similar?
-            // For now, we return it, but maybe the frontend handles "not ready".
-            // Actually, based on User Request, "Update Available" shouldn't show if it's not ready.
-            // But if we return Ok(info) here, the frontend SHOWS it.
-            // If updater.json failed, it likely means the asset isn't uploaded.
-            // So we should maybe return Ok(info) with has_update=false if checking updater.json failed?
-            // Or just log it.
-            // Let's stick to the plan: Prioritize updater.json. If that fails, we fallback.
-            // Use the fallback but maybe the user will see "Auto update failed" and use manual.
+    match check_github_api_channel(channel).await {
+        Ok(info) => return Ok(info),
+        Err(e) => {
+            logger::log_warn(&format!(
+                "GitHub API ({:?}) check failed: {}. Trying static fallbacks...",
+                channel, e
+            ));
+        }
+    }
+
+    // 3. Try GitHub Raw (only applies to stable/main)
+    if channel == UpdateChannel::Stable {
+        if let Ok(info) = check_static_url(GITHUB_RAW_URL, "GitHub Raw").await {
             return Ok(info);
         }
-        Err(e) => {
-            logger::log_warn(&format!(
-                "GitHub API check failed: {}. Trying fallbacks...",
-                e
-            ));
+        if let Ok(info) = check_static_url(JSDELIVR_URL, "jsDelivr").await {
+            return Ok(info);
         }
     }
 
-    // 3. Try GitHub Raw
-    match check_static_url(GITHUB_RAW_URL, "GitHub Raw").await {
-        Ok(info) => return Ok(info),
-        Err(e) => {
-            logger::log_warn(&format!(
-                "GitHub Raw check failed: {}. Trying next fallback...",
-                e
-            ));
-        }
-    }
-
-    // 4. Try jsDelivr
-    match check_static_url(JSDELIVR_URL, "jsDelivr").await {
-        Ok(info) => return Ok(info),
-        Err(e) => {
-            logger::log_error(&format!("All update checks failed. Last error: {}", e));
-            return Err(e);
-        }
-    }
+    Err(format!(
+        "Failed to fetch updates for {:?} channel. Please check network/proxy settings.",
+        channel
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -172,65 +241,6 @@ struct UpdaterJson {
     version: String,
     notes: Option<String>,
     pub_date: Option<String>,
-}
-
-async fn check_updater_json() -> Result<UpdateInfo, String> {
-    let client = create_client().await?;
-    logger::log_info("Checking for updates via updater.json...");
-
-    let response = client
-        .get(UPDATER_JSON_URL)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
-
-    if !response.status().is_success() {
-        return Err(format!(
-            "updater.json returned status: {}",
-            response.status()
-        ));
-    }
-
-    let updater_info: UpdaterJson = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse updater.json: {}", e))?;
-
-    let latest_version = updater_info.version.trim_start_matches('v').to_string();
-    let current_version = CURRENT_VERSION.to_string();
-    let has_update = compare_versions(&latest_version, &current_version);
-
-    if has_update {
-        logger::log_info(&format!(
-            "New version found (updater.json): {} (Current: {})",
-            latest_version, current_version
-        ));
-    } else {
-        logger::log_info(&format!(
-            "Up to date (updater.json): {} (Matches {})",
-            current_version, latest_version
-        ));
-    }
-
-    let download_url = format!(
-        "https://github.com/lbjlaq/Antigravity-Manager/releases/tag/v{}",
-        latest_version
-    );
-
-    Ok(UpdateInfo {
-        current_version,
-        latest_version,
-        has_update,
-        download_url,
-        release_notes: updater_info
-            .notes
-            .unwrap_or_else(|| "Release notes available on GitHub.".to_string()),
-        published_at: updater_info
-            .pub_date
-            .unwrap_or_else(|| Utc::now().to_rfc3339()),
-        source: Some("updater.json".to_string()),
-        proxy_url: None,
-    })
 }
 
 async fn create_client() -> Result<reqwest::Client, String> {
@@ -259,25 +269,176 @@ async fn create_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Failed to create HTTP client: {}", e))
 }
 
-async fn check_github_api() -> Result<UpdateInfo, String> {
+async fn check_updater_json_channel(channel: UpdateChannel) -> Result<UpdateInfo, String> {
     let client = create_client().await?;
+    let target_url = match channel {
+        UpdateChannel::Stable => STABLE_UPDATER_JSON_URL,
+        UpdateChannel::Beta => PREVIEW_UPDATER_JSON_URL,
+    };
 
-    logger::log_info("Checking for updates via GitHub API...");
+    logger::log_info(&format!(
+        "Checking for updates via {:?} updater.json ({})...",
+        channel, target_url
+    ));
 
-    let response = client
-        .get(GITHUB_API_URL)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+    let response = client.get(target_url).send().await;
 
-    if !response.status().is_success() {
-        return Err(format!("GitHub API returned status: {}", response.status()));
-    }
+    let (response, actual_url) = match response {
+        Ok(res) if res.status().is_success() => (res, target_url.to_string()),
+        other => {
+            if channel == UpdateChannel::Beta {
+                logger::log_info("Preview updater.json endpoint unavailable, checking latest prerelease assets from GitHub API...");
+                if let Ok(asset_url) = fetch_prerelease_updater_json_url(&client).await {
+                    let res = client
+                        .get(&asset_url)
+                        .send()
+                        .await
+                        .map_err(|e| format!("Request failed: {}", e))?;
+                    (res, asset_url)
+                } else {
+                    let err_msg = match other {
+                        Ok(res) => format!("status {}", res.status()),
+                        Err(e) => e.to_string(),
+                    };
+                    return Err(format!("updater.json returned {}", err_msg));
+                }
+            } else {
+                let err_msg = match other {
+                    Ok(res) => format!("status {}", res.status()),
+                    Err(e) => e.to_string(),
+                };
+                return Err(format!("updater.json returned {}", err_msg));
+            }
+        }
+    };
 
-    let release: GitHubRelease = response
+    let updater_info: UpdaterJson = response
         .json()
         .await
-        .map_err(|e| format!("Failed to parse release info: {}", e))?;
+        .map_err(|e| format!("Failed to parse updater.json: {}", e))?;
+
+    let latest_version = updater_info.version.trim_start_matches('v').to_string();
+    let current_version = CURRENT_VERSION.to_string();
+    let has_update = compare_versions(&latest_version, &current_version);
+
+    if has_update {
+        logger::log_info(&format!(
+            "New version found ({:?} updater.json): {} (Current: {})",
+            channel, latest_version, current_version
+        ));
+    } else {
+        logger::log_info(&format!(
+            "Up to date ({:?} updater.json): {} (Matches {})",
+            channel, current_version, latest_version
+        ));
+    }
+
+    let download_url = format!(
+        "https://github.com/lbjlaq/Antigravity-Manager/releases/tag/v{}",
+        latest_version
+    );
+
+    Ok(UpdateInfo {
+        current_version,
+        latest_version,
+        has_update,
+        download_url,
+        release_notes: updater_info
+            .notes
+            .unwrap_or_else(|| "Release notes available on GitHub.".to_string()),
+        published_at: updater_info
+            .pub_date
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        source: Some(format!("{:?} updater.json", channel)),
+        proxy_url: None,
+        channel: Some(channel),
+        updater_json_url: Some(actual_url),
+    })
+}
+
+async fn fetch_prerelease_updater_json_url(client: &reqwest::Client) -> Result<String, String> {
+    let response = client
+        .get(GITHUB_RELEASES_API_URL)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to query releases: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Releases API returned status {}",
+            response.status()
+        ));
+    }
+
+    let releases: Vec<GitHubRelease> = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse releases: {}", e))?;
+
+    for release in releases {
+        if release.prerelease {
+            if let Some(asset) = release
+                .assets
+                .into_iter()
+                .find(|a| a.name.eq_ignore_ascii_case("updater.json"))
+            {
+                return Ok(asset.browser_download_url);
+            }
+        }
+    }
+
+    Err("No updater.json found in latest pre-releases".to_string())
+}
+
+async fn check_github_api_channel(channel: UpdateChannel) -> Result<UpdateInfo, String> {
+    let client = create_client().await?;
+    logger::log_info(&format!(
+        "Checking for updates via GitHub API ({:?} channel)...",
+        channel
+    ));
+
+    let release = match channel {
+        UpdateChannel::Stable => {
+            let response = client
+                .get(GITHUB_API_URL)
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                return Err(format!("GitHub API returned status: {}", response.status()));
+            }
+
+            response
+                .json::<GitHubRelease>()
+                .await
+                .map_err(|e| format!("Failed to parse release info: {}", e))?
+        }
+        UpdateChannel::Beta => {
+            let response = client
+                .get(GITHUB_RELEASES_API_URL)
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+
+            if !response.status().is_success() {
+                return Err(format!("GitHub API returned status: {}", response.status()));
+            }
+
+            let releases: Vec<GitHubRelease> = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse releases: {}", e))?;
+
+            // 优先查找最新的 pre-release
+            let latest_pre = releases
+                .into_iter()
+                .find(|r| r.prerelease)
+                .ok_or_else(|| "No pre-release found on GitHub".to_string())?;
+
+            latest_pre
+        }
+    };
 
     let latest_version = release.tag_name.trim_start_matches('v').to_string();
     let current_version = CURRENT_VERSION.to_string();
@@ -285,13 +446,13 @@ async fn check_github_api() -> Result<UpdateInfo, String> {
 
     if has_update {
         logger::log_info(&format!(
-            "New version found (API): {} (Current: {})",
-            latest_version, current_version
+            "New version found (API {:?}): {} (Current: {})",
+            channel, latest_version, current_version
         ));
     } else {
         logger::log_info(&format!(
-            "Up to date (API): {} (Matches {})",
-            current_version, latest_version
+            "Up to date (API {:?}): {} (Matches {})",
+            channel, current_version, latest_version
         ));
     }
 
@@ -300,10 +461,17 @@ async fn check_github_api() -> Result<UpdateInfo, String> {
         latest_version,
         has_update,
         download_url: release.html_url,
-        release_notes: release.body,
-        published_at: release.published_at,
-        source: Some("GitHub API".to_string()),
+        release_notes: release.body.unwrap_or_default(),
+        published_at: release
+            .published_at
+            .unwrap_or_else(|| Utc::now().to_rfc3339()),
+        source: Some(format!("GitHub API ({:?})", channel)),
         proxy_url: None,
+        channel: Some(channel),
+        updater_json_url: match channel {
+            UpdateChannel::Beta => Some(PREVIEW_UPDATER_JSON_URL.to_string()),
+            UpdateChannel::Stable => Some(STABLE_UPDATER_JSON_URL.to_string()),
+        },
     })
 }
 
@@ -368,29 +536,63 @@ async fn check_static_url(url: &str, source_name: &str) -> Result<UpdateInfo, St
         published_at: Utc::now().to_rfc3339(), // Approximate time
         source: Some(source_name.to_string()),
         proxy_url: None,
+        channel: Some(UpdateChannel::Stable),
+        updater_json_url: Some(STABLE_UPDATER_JSON_URL.to_string()),
     })
 }
 
-/// Compare two semantic versions (e.g., "3.3.30" vs "3.3.29")
-fn compare_versions(latest: &str, current: &str) -> bool {
-    let parse_version =
-        |v: &str| -> Vec<u32> { v.split('.').filter_map(|s| s.parse::<u32>().ok()).collect() };
+/// Compare two semantic versions (supports pre-release tags like "4.8.1-beta.2" vs "4.8.1-beta.1")
+pub fn compare_versions(latest: &str, current: &str) -> bool {
+    let parse_semver = |v: &str| -> (Vec<u32>, Option<(String, u32)>) {
+        let clean = v.trim().trim_start_matches('v');
+        if let Some((main_part, pre_part)) = clean.split_once('-') {
+            let nums: Vec<u32> = main_part
+                .split('.')
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect();
+            // 解析预发布段，如 beta.2 -> ("beta", 2)
+            let pre_info = if let Some((tag, num_str)) = pre_part.split_once('.') {
+                Some((tag.to_lowercase(), num_str.parse::<u32>().unwrap_or(0)))
+            } else {
+                Some((pre_part.to_lowercase(), 0))
+            };
+            (nums, pre_info)
+        } else {
+            let nums: Vec<u32> = clean
+                .split('.')
+                .filter_map(|s| s.parse::<u32>().ok())
+                .collect();
+            (nums, None)
+        }
+    };
 
-    let latest_parts = parse_version(latest);
-    let current_parts = parse_version(current);
+    let (latest_nums, latest_pre) = parse_semver(latest);
+    let (current_nums, current_pre) = parse_semver(current);
 
-    for i in 0..latest_parts.len().max(current_parts.len()) {
-        let latest_part = latest_parts.get(i).unwrap_or(&0);
-        let current_part = current_parts.get(i).unwrap_or(&0);
-
-        if latest_part > current_part {
+    // 1. 先比较主版本号 [major, minor, patch]
+    for i in 0..latest_nums.len().max(current_nums.len()) {
+        let l = latest_nums.get(i).copied().unwrap_or(0);
+        let c = current_nums.get(i).copied().unwrap_or(0);
+        if l > c {
             return true;
-        } else if latest_part < current_part {
-            return false; // e.g. local: 3.3.30, remote: 3.3.30 => false
+        } else if l < c {
+            return false;
         }
     }
 
-    false
+    // 2. 主版本号完全相同时，检查 pre-release (标准 SemVer 规则：无 pre-release > 有 pre-release)
+    match (latest_pre, current_pre) {
+        (None, Some(_)) => true,  // e.g. latest 4.8.1 正式版 > current 4.8.1-beta.2
+        (Some(_), None) => false, // e.g. latest 4.8.1-beta.2 < current 4.8.1 正式版
+        (Some((l_tag, l_num)), Some((c_tag, c_num))) => {
+            if l_tag != c_tag {
+                l_tag > c_tag
+            } else {
+                l_num > c_num // e.g. beta.2 > beta.1
+            }
+        }
+        (None, None) => false, // 完全相同版本
+    }
 }
 
 /// Check if enough time has passed since last check
@@ -440,6 +642,24 @@ pub fn save_update_settings(settings: &UpdateSettings) -> Result<(), String> {
 
     std::fs::write(&settings_path, content)
         .map_err(|e| format!("Failed to write settings file: {}", e))
+}
+
+/// 读取现有设置、应用补丁后落盘，返回合并后的完整设置。
+///
+/// 配置文件尚不存在时 `load_update_settings` 会返回按构建版本推导的默认值，
+/// 因此首次保存同样能产出完整、合法的配置。空补丁一律拒绝，避免两条传输链路
+/// （Web / Tauri）出现“字段名拼错但静默成功”的假象。
+pub fn patch_update_settings(patch: UpdateSettingsPatch) -> Result<UpdateSettings, String> {
+    if patch.is_empty() {
+        return Err(
+            "Empty update settings patch: expected at least one field to update".to_string(),
+        );
+    }
+
+    let mut settings = load_update_settings()?;
+    settings.apply_patch(patch);
+    save_update_settings(&settings)?;
+    Ok(settings)
 }
 
 /// Update last check time
@@ -565,6 +785,55 @@ mod tests {
         assert!(compare_versions("4.0.3", "3.3.35"));
         assert!(!compare_versions("3.3.34", "3.3.35"));
         assert!(!compare_versions("3.3.35", "3.3.35"));
+
+        // Pre-release tests
+        assert!(compare_versions("4.8.1-beta.2", "4.8.1-beta.1"));
+        assert!(!compare_versions("4.8.1-beta.1", "4.8.1-beta.2"));
+        assert!(compare_versions("4.8.1", "4.8.1-beta.2")); // 正式版 > 预发布版
+        assert!(!compare_versions("4.8.1-beta.2", "4.8.1"));
+        assert!(compare_versions("4.8.2-beta.1", "4.8.1"));
+    }
+
+    #[test]
+    fn test_apply_patch_preserves_unspecified_fields() {
+        let mut settings = UpdateSettings {
+            auto_check: true,
+            last_check_time: 1_700_000_000,
+            check_interval_hours: 6,
+            update_channel: UpdateChannel::Beta,
+        };
+
+        settings.apply_patch(UpdateSettingsPatch {
+            auto_check: Some(false),
+            ..Default::default()
+        });
+
+        assert!(!settings.auto_check);
+        assert_eq!(settings.last_check_time, 1_700_000_000);
+        assert_eq!(settings.check_interval_hours, 6);
+        assert_eq!(settings.update_channel, UpdateChannel::Beta);
+    }
+
+    #[test]
+    fn test_update_settings_patch_only_contains_provided_fields() {
+        let patch: UpdateSettingsPatch = serde_json::from_value(serde_json::json!({
+            "update_channel": "beta"
+        }))
+        .expect("partial patch should deserialize");
+
+        assert!(!patch.is_empty());
+        assert_eq!(patch.auto_check, None);
+        assert_eq!(patch.last_check_time, None);
+        assert_eq!(patch.update_channel, Some(UpdateChannel::Beta));
+
+        let empty: UpdateSettingsPatch = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_patch_update_settings_rejects_empty_patch() {
+        // 空补丁在触达磁盘前即被拒绝，不依赖数据目录环境
+        assert!(patch_update_settings(UpdateSettingsPatch::default()).is_err());
     }
 
     #[test]

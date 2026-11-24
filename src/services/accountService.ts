@@ -1,6 +1,37 @@
 import i18n from '../i18n';
-import { Account, DeviceProfile, DeviceProfileVersion, QuotaData } from '../types/account';
+import { Account, ActiveClientsStatus, DeviceProfile, DeviceProfileVersion, QuotaData, ImportAccountEntry, BatchImportResult, ModelPriorities } from '../types/account';
+export type { ImportAccountEntry, BatchImportResult };
 import { request as invoke } from '../utils/request';
+
+export async function updateAccountPriority(
+    accountId: string,
+    priority: number,
+    modelPriorities?: ModelPriorities
+): Promise<void> {
+    if (!Number.isInteger(priority) || priority < 1 || priority > 100) {
+        throw new Error(i18n.t('accounts.priority_invalid'));
+    }
+    const normalizedModelPriorities: Record<string, number> | undefined =
+        modelPriorities !== undefined ? {} : undefined;
+    if (modelPriorities && normalizedModelPriorities) {
+        for (const key of ['gemini', 'claude'] as const) {
+            const val = modelPriorities[key];
+            if (val !== undefined && val !== null) {
+                if (!Number.isInteger(val) || val < 1 || val > 100) {
+                    throw new Error(i18n.t('accounts.priority_invalid'));
+                }
+                normalizedModelPriorities[key] = val;
+            }
+        }
+    }
+    await invoke('update_account_priority', {
+        accountId,
+        priority,
+        ...(normalizedModelPriorities !== undefined
+            ? { modelPriorities: normalizedModelPriorities }
+            : {}),
+    });
+}
 
 // 检查环境 (可选)
 function ensureTauriEnvironment() {
@@ -16,12 +47,19 @@ export async function listAccounts(): Promise<Account[]> {
     if (response && typeof response === 'object' && Array.isArray(response.accounts)) {
         return response.accounts;
     }
-    // 否则直接返回响应内容（假设为数组）
-    return response || [];
+    if (Array.isArray(response)) {
+        return response;
+    }
+    return [];
 }
 
 export async function getCurrentAccount(): Promise<Account | null> {
     return await invoke('get_current_account');
+}
+
+export async function getActiveClientsStatus(): Promise<ActiveClientsStatus> {
+    const res = await invoke<ActiveClientsStatus>('get_active_clients_status');
+    return res || {};
 }
 
 export async function addAccount(email: string, refreshToken: string): Promise<Account> {
@@ -30,6 +68,10 @@ export async function addAccount(email: string, refreshToken: string): Promise<A
 
 export async function deleteAccount(accountId: string): Promise<void> {
     return await invoke('delete_account', { accountId });
+}
+
+export async function releaseAccountQoSJail(accountId: string): Promise<void> {
+    return await invoke('release_account_qos_jail', { accountId });
 }
 
 export async function deleteAccounts(accountIds: string[]): Promise<void> {
@@ -101,6 +143,13 @@ export interface OAuthClientInfo {
     client_id: string;
     is_active: boolean;
     is_builtin: boolean;
+    is_gcp_tos?: boolean;
+}
+
+export async function prepareOAuthUrl(oauthClientKey?: string): Promise<string> {
+    const res = await invoke<any>('prepare_oauth_url', oauthClientKey ? { oauthClientKey } : undefined);
+    const url = typeof res === 'string' ? res : res?.url;
+    return url || '';
 }
 
 export async function listOAuthClients(): Promise<OAuthClientInfo[]> {
@@ -120,6 +169,10 @@ export async function setActiveOAuthClient(clientKey: string): Promise<void> {
 }
 
 // 导入
+export async function batchImportAccounts(entries: ImportAccountEntry[]): Promise<BatchImportResult> {
+    return await invoke<BatchImportResult>('batch_import_accounts', { entries });
+}
+
 export async function importV1Accounts(): Promise<Account[]> {
     return await invoke('import_v1_accounts');
 }
@@ -140,6 +193,10 @@ export async function syncAccountFromDb(): Promise<Account | null> {
 
 export async function toggleProxyStatus(accountId: string, enable: boolean, reason?: string): Promise<void> {
     return await invoke('toggle_proxy_status', { accountId, enable, reason });
+}
+
+export async function clearAccountForbidden(accountId: string): Promise<void> {
+    return await invoke('clear_account_forbidden', { accountId });
 }
 
 /**
@@ -221,3 +278,16 @@ export async function updateAccountLabel(accountId: string, label: string): Prom
     return await invoke('update_account_label', { accountId, label });
 }
 
+// GCP 项目 ID 相关
+export async function updateAccountProjectId(accountId: string, projectId: string | null): Promise<void> {
+    return await invoke('update_account_project_id', { accountId, projectId: projectId || null });
+}
+
+export async function autoFetchAccountProjectId(accountId: string): Promise<string> {
+    return await invoke('auto_fetch_account_project_id', { accountId });
+}
+
+// 解除 403 模型冻结
+export async function removeAccountForbiddenModel(accountId: string, model?: string): Promise<boolean> {
+    return await invoke('remove_account_forbidden_model', { accountId, model: model || null });
+}

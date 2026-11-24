@@ -58,6 +58,244 @@ fn extract_boundary(content_type: &str) -> Option<String> {
     })
 }
 
+/// 检测纯文本是否为典型探活/连通性探测词
+fn is_probe_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let clean = lower.trim_end_matches(&['.', '?', '!', '~', '。', '？', '！', '～', '=', ' '][..]);
+    let clean_no_spaces = clean.replace(' ', "");
+
+    matches!(
+        clean,
+        "hi" | "hello"
+            | "hey"
+            | "ping"
+            | "pong"
+            | "test"
+            | "testing"
+            | "echo"
+            | "health"
+            | "healthcheck"
+            | "health_check"
+            | "health check"
+            | "check"
+            | "are you there"
+            | "are you alive"
+            | "warmup"
+            | "你好"
+            | "您好"
+            | "在吗"
+            | "测试"
+            | "测速"
+    ) || matches!(clean_no_spaces.as_str(), "1+1" | "1+1=2" | "1+2" | "2+2")
+}
+
+/// 检测 Gemini 格式负载（包括顶层或位于 "request" 内部）是否为纯粹的探针请求
+fn is_gemini_probe_payload(val: &Value) -> bool {
+    let req_obj = val.get("request").unwrap_or(val);
+
+    // 1. 系统指令：若存在非空 systemInstruction，绝非探针
+    if let Some(sys) = req_obj
+        .get("systemInstruction")
+        .or_else(|| req_obj.get("system_instruction"))
+    {
+        if let Some(parts) = sys.get("parts").and_then(|p| p.as_array()) {
+            let has_content = parts.iter().any(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map_or(false, |s| !s.trim().is_empty())
+            });
+            if has_content {
+                return false;
+            }
+        }
+    }
+
+    // 2. 工具调用：若包含 tools 且非空，绝非探针
+    if let Some(tools) = req_obj.get("tools").and_then(|t| t.as_array()) {
+        if !tools.is_empty() {
+            return false;
+        }
+    }
+
+    // 3. contents 数组：必须严格只有 1 条消息且角色为 "user"
+    let Some(contents) = req_obj.get("contents").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    if contents.len() != 1 {
+        return false;
+    }
+
+    let first_content = &contents[0];
+    let role = first_content
+        .get("role")
+        .and_then(|r| r.as_str())
+        .unwrap_or("");
+    if role != "user" {
+        return false;
+    }
+
+    // 4. parts 数组：必须严格只有 1 个 part，且为纯文本
+    let Some(parts) = first_content.get("parts").and_then(|p| p.as_array()) else {
+        return false;
+    };
+    if parts.len() != 1 {
+        return false;
+    }
+
+    let first_part = &parts[0];
+    if first_part.get("inlineData").is_some()
+        || first_part.get("functionCall").is_some()
+        || first_part.get("fileData").is_some()
+    {
+        return false;
+    }
+
+    let Some(text) = first_part.get("text").and_then(|t| t.as_str()) else {
+        return false;
+    };
+
+    is_probe_text(text)
+}
+
+/// 检测原始客户端请求报文（兼容 OpenAI / Claude 等不同协议格式）是否为纯粹的探针请求
+fn is_raw_request_probe_payload(val: &Value) -> bool {
+    // 1. 系统指令/提示词检查
+    if let Some(sys) = val.get("system") {
+        match sys {
+            Value::String(s) if !s.trim().is_empty() => return false,
+            Value::Array(arr) if !arr.is_empty() => return false,
+            _ => {}
+        }
+    }
+    if let Some(ins) = val.get("instructions").and_then(|v| v.as_str()) {
+        if !ins.trim().is_empty() {
+            return false;
+        }
+    }
+
+    // 2. 工具调用检查
+    if let Some(tools) = val.get("tools").and_then(|t| t.as_array()) {
+        if !tools.is_empty() {
+            return false;
+        }
+    }
+
+    // 3. OpenAI / Claude 风格 messages 检查
+    if let Some(messages) = val.get("messages").and_then(|m| m.as_array()) {
+        if messages.len() != 1 {
+            return false;
+        }
+        let msg = &messages[0];
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "user" {
+            return false;
+        }
+
+        // content 可以是字符串，也可以是 ContentBlock 数组
+        if let Some(content_str) = msg.get("content").and_then(|c| c.as_str()) {
+            return is_probe_text(content_str);
+        } else if let Some(content_arr) = msg.get("content").and_then(|c| c.as_array()) {
+            if content_arr.len() == 1 {
+                let first_block = &content_arr[0];
+                if let Some(text) = first_block.get("text").and_then(|t| t.as_str()) {
+                    return is_probe_text(text);
+                }
+            }
+        }
+        return false;
+    }
+
+    // 4. OpenAI Responses API 风格 input 检查
+    if let Some(input) = val.get("input").and_then(|i| i.as_array()) {
+        if input.len() != 1 {
+            return false;
+        }
+        let item = &input[0];
+        let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        if role != "user" {
+            return false;
+        }
+        if let Some(content_str) = item.get("content").and_then(|c| c.as_str()) {
+            return is_probe_text(content_str);
+        }
+        return false;
+    }
+
+    // 5. 原生 Gemini 格式 contents 检查
+    if val.get("contents").is_some() {
+        return is_gemini_probe_payload(val);
+    }
+
+    false
+}
+
+/// 综合判断是否为第三方网关探测请求
+fn is_third_party_probe_request(request_body: Option<&str>, upstream_body: Option<&str>) -> bool {
+    // 优先从转换后的上游 Gemini 报文进行协议无关判定
+    if let Some(up_str) = upstream_body {
+        if let Ok(json_val) = serde_json::from_str::<Value>(up_str) {
+            if is_gemini_probe_payload(&json_val) {
+                return true;
+            }
+        }
+    }
+
+    // 兜底从客户端原始请求报文判定
+    if let Some(raw_str) = request_body {
+        if let Ok(json_val) = serde_json::from_str::<Value>(raw_str) {
+            if is_raw_request_probe_payload(&json_val) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// 噪音请求日志抑制判定。
+///
+/// 面板「捕获健康请求」胶囊开关（`capture_health_logs`）**默认关闭**。关闭时：
+/// 1. **所有 GET 成功请求一律不记录、不落库**（含 `/v1/models`、`/v1beta/models`、`/v1/models/claude`
+/// 等模型列表轮询，以及 `/health` `/healthz` `/api/health` 探针）。
+/// 2. **第三方网关（如 NewAPI / OneAPI 等）发送的纯粹探活/测试请求（POST 且仅含单条极简测试消息如 "hi"）成功时不记录、不落库**。
+///
+/// 之所以抑制这类请求：真实客户端的健康/能力探测会高频轮询模型列表或定期发送 "hi" 探活探测，
+/// 这类请求没有对话语义、无业务价值，却会把真实业务日志挤出视图。
+///
+/// 边界（刻意保守，绝不影响排障）：
+/// - 失败请求（非 2xx）**始终记录**，无论路径与方法，报错始终展示；
+/// - 真实业务请求（多轮对话、带系统提示词、带工具、非探针文本等）**始终记录**；
+/// - 开关开启（或环境变量 `ABV_LOG_HEALTH_CHECKS` 为真）时全部记录并落库。
+fn should_skip_request_log(
+    method: &str,
+    status: axum::http::StatusCode,
+    capture_enabled: bool,
+    request_body: Option<&str>,
+    upstream_body: Option<&str>,
+) -> bool {
+    if capture_enabled || !status.is_success() {
+        return false;
+    }
+
+    if method.eq_ignore_ascii_case("GET") {
+        return true;
+    }
+
+    if method.eq_ignore_ascii_case("POST") {
+        return is_third_party_probe_request(request_body, upstream_body);
+    }
+
+    false
+}
+
+fn should_log_health_checks() -> bool {
+    crate::proxy::monitor::health_log_capture_enabled_by_env()
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> {
     if needle.is_empty() || start >= haystack.len() {
         return None;
@@ -270,7 +508,7 @@ fn record_user_token_usage(
         let _ = crate::modules::user_token_db::record_token_usage_and_ip(
             &identity.token_id,
             log.client_ip.as_deref().unwrap_or("127.0.0.1"),
-            log.model.as_deref().unwrap_or("unknown"),
+            log.effective_model(),
             log.input_tokens.unwrap_or(0) as i32,
             log.output_tokens.unwrap_or(0) as i32,
             log.status as u16,
@@ -336,9 +574,9 @@ fn build_canonical_consolidated_response(
         for tc in &tool_calls {
             if let Some(call_id) = tc.get("id").and_then(|v| v.as_str()) {
                 if !call_id.is_empty() {
-                    if let Some(sig) =
-                        crate::proxy::SignatureCache::global().get_tool_signature(call_id)
-                    {
+                    if let Some(sig) = session_id.and_then(|sid| {
+                        crate::proxy::SignatureCache::global().get_tool_signature(sid, call_id)
+                    }) {
                         thinking_signature = sig;
                         break;
                     }
@@ -346,10 +584,29 @@ fn build_canonical_consolidated_response(
             }
         }
         if thinking_signature.is_empty() {
-            if let Some(sid) = session_id {
-                if let Some(sig) = crate::proxy::SignatureCache::global().get_session_signature(sid)
+            // 1. 优先按当前轮次的思考文本片段精准直捞专属签名
+            if !thinking_content.is_empty() {
+                let trimmed = thinking_content.trim();
+                let snippet = crate::proxy::mappers::common_utils::safe_truncate_str(trimmed, 32);
+                if let Some(sig) =
+                    crate::modules::proxy_db::lookup_signature_by_thought_snippet(snippet)
                 {
                     thinking_signature = sig;
+                }
+            }
+
+            // 2. 兜底按会话状态机与会话数据库查找最新签名
+            if thinking_signature.is_empty() {
+                if let Some(sid) = session_id {
+                    if let Some(sig) =
+                        crate::proxy::SignatureCache::global().get_session_signature(sid)
+                    {
+                        thinking_signature = sig;
+                    } else if let Some(sig) =
+                        crate::modules::proxy_db::lookup_latest_thinking_signature(sid)
+                    {
+                        thinking_signature = sig;
+                    }
                 }
             }
         }
@@ -405,6 +662,7 @@ fn consolidate_non_streaming_response(
     raw_json: &Value,
     log: &ProxyRequestLog,
     headers_map: &serde_json::Map<String, Value>,
+    upstream_attempts: Option<Vec<crate::proxy::upstream::client::FallbackAttemptLog>>,
 ) -> Option<Value> {
     // 若本就已是统一的 consolidated 格式 (例如带有顶层 thinking/tool_calls 且无 choices/candidates)，直接返回 None
     if (raw_json.get("thinking").is_some()
@@ -593,15 +851,51 @@ fn consolidate_non_streaming_response(
         "norm_ms",
         "thinking_ms",
         "ttft_ms",
+        "ttft_overhead_ms",
         "stream_ms",
         "total_ms",
     ] {
         let hdr_key = format!("x-timing-{}", key);
         if let Some(val) = headers_map.get(&hdr_key).and_then(|v| v.as_str()) {
             if let Ok(n) = val.parse::<f64>() {
+                if key == "ttft_ms" && n <= 0.0 {
+                    continue;
+                }
                 let out_key = key.replace("_ms", "_s");
                 timing_obj.insert(out_key, serde_json::json!(n / 1000.0));
             }
+        }
+    }
+    if !timing_obj.contains_key("ttft_s") {
+        if let Some(hms) = headers_map
+            .get("x-timing-headers-ms")
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(n) = hms.parse::<f64>() {
+                if n > 0.0 {
+                    timing_obj.insert("ttft_s".to_string(), serde_json::json!(n / 1000.0));
+                }
+            }
+        }
+    }
+    if let (Some(ttft), Some(overhead)) = (
+        timing_obj.get("ttft_s").and_then(|v| v.as_f64()),
+        timing_obj.get("ttft_overhead_s").and_then(|v| v.as_f64()),
+    ) {
+        if ttft > 0.0 && overhead > 0.0 {
+            timing_obj.insert(
+                "ttft_total_wait_s".to_string(),
+                serde_json::json!(ttft + overhead),
+            );
+        }
+    }
+
+    if let Some(attempts) = upstream_attempts {
+        if !attempts.is_empty() {
+            timing_obj.insert(
+                "ttft_attempts".to_string(),
+                serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+            );
         }
     }
     if !timing_obj.contains_key("total_s") {
@@ -720,6 +1014,27 @@ pub async fn monitor_middleware(
         uri.split("/v1beta/models/")
             .nth(1)
             .and_then(|s| s.split(':').next())
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/v1/models/claude/") {
+        uri.split("/v1/models/claude/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/v1/models/") {
+        uri.split("/v1/models/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/v1/model/") {
+        uri.split("/v1/model/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
+            .map(|s| s.to_string())
+    } else if uri.contains("/responses/models/") {
+        uri.split("/responses/models/")
+            .nth(1)
+            .and_then(|s| s.split('?').next())
             .map(|s| s.to_string())
     } else {
         None
@@ -785,6 +1100,7 @@ pub async fn monitor_middleware(
         .await;
     let upstream_request_body = upstream_holder.take();
     let upstream_request_headers = upstream_holder.take_headers();
+    let upstream_attempts = upstream_holder.take_attempts();
     let response_headers_json =
         crate::proxy::payload_audit::headers_to_redacted_json(response.headers());
 
@@ -792,6 +1108,21 @@ pub async fn monitor_middleware(
 
     let duration = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
+
+    // 过滤噪音请求，避免客户端探针刷屏淹没真实业务日志 (Issue #3498 + `/v1/models` 轮询刷屏 + 三方网关探活)
+    // 胶囊开关关闭时（默认）：所有 GET 成功请求与 POST 探针成功请求不记录、不落库；失败请求与非探针业务请求始终记录。
+    // 详见 `should_skip_request_log` 的行为边界说明。
+    let capture_health_enabled =
+        state.monitor.is_capture_health_logs() || should_log_health_checks();
+    if should_skip_request_log(
+        &method,
+        response.status(),
+        capture_health_enabled,
+        request_body_str.as_deref(),
+        upstream_request_body.as_deref(),
+    ) {
+        return response;
+    }
 
     let content_type = response
         .headers()
@@ -814,11 +1145,20 @@ pub async fn monitor_middleware(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // Extract upstream model from X-Upstream-Model header if present
+    let upstream_model = response
+        .headers()
+        .get("X-Upstream-Model")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Determine protocol from URL path
-    let protocol = if uri.contains("/v1/messages") {
+    let protocol = if uri.contains("/v1/messages") || uri.contains("/v1/models/claude") {
         Some("anthropic".to_string())
     } else if uri.contains("/v1beta/models") {
         Some("gemini".to_string())
+    } else if uri.contains("/responses") {
+        Some("responses".to_string())
     } else if uri.starts_with("/v1/") {
         Some("openai".to_string())
     } else {
@@ -851,6 +1191,7 @@ pub async fn monitor_middleware(
         duration,
         model,
         mapped_model,
+        upstream_model,
         account_email,
         client_ip,
         error: None,
@@ -863,24 +1204,35 @@ pub async fn monitor_middleware(
         input_tokens: None,
         output_tokens: None,
         cached_tokens: None,
+        reasoning_tokens: None,
         protocol,
         username,
         session_id,
     };
 
     if content_type.contains("text/event-stream") {
+        let stream_ttft_capture = response
+            .extensions()
+            .get::<crate::proxy::pipeline::timing::StreamTtftCapture>()
+            .cloned();
         let (parts, body) = response.into_parts();
         let mut stream = body.into_data_stream();
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let start_instant = start;
+        let mut attempts_for_stream = upstream_attempts.clone();
 
         tokio::spawn(async move {
             let stream_start = std::time::Instant::now();
             let mut all_stream_data = Vec::new();
             let mut last_few_bytes = Vec::new();
+            let mut first_chunk_elapsed_ms: Option<f64> = None;
 
             while let Some(chunk_res) = next_chunk_while_receiver_open(&mut stream, &tx).await {
                 if let Ok(chunk) = chunk_res {
+                    if first_chunk_elapsed_ms.is_none() && !chunk.is_empty() {
+                        first_chunk_elapsed_ms =
+                            Some(start_instant.elapsed().as_secs_f64() * 1000.0);
+                    }
                     all_stream_data.extend_from_slice(&chunk);
 
                     if chunk.len() > 8192 {
@@ -911,6 +1263,75 @@ pub async fn monitor_middleware(
                 .as_ref()
                 .and_then(|h| serde_json::from_str(h).ok())
                 .unwrap_or_default();
+
+            // 解析真实纯净 TTFT (消除发头时 -1 哨兵值造成的负时间 Bug)
+            let mut final_ttft_ms: Option<f64> = None;
+            // 1. 优先使用生效端点探针捕获到的真实首包耗时
+            if let Some(cap) = stream_ttft_capture.as_ref().and_then(|c| c.get()) {
+                if cap > 0.0 {
+                    final_ttft_ms = Some(cap);
+                }
+            }
+            // 2. 其次使用 monitor 自身观测到的首个非空数据块耗时
+            if final_ttft_ms.is_none() {
+                if let Some(ms) = first_chunk_elapsed_ms {
+                    if ms > 0.0 {
+                        final_ttft_ms = Some(ms);
+                    }
+                }
+            }
+            // 3. 再次使用 headers_map 中有效的正数 TTFT
+            if final_ttft_ms.is_none() {
+                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
+                    if let Ok(n) = ttft.parse::<f64>() {
+                        if n > 0.0 {
+                            final_ttft_ms = Some(n);
+                        }
+                    }
+                }
+            }
+            // 4. 再次兜底使用响应头到达耗时 (x-timing-headers-ms)
+            if final_ttft_ms.is_none() {
+                if let Some(hms) = headers_map
+                    .get("x-timing-headers-ms")
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(n) = hms.parse::<f64>() {
+                        if n > 0.0 {
+                            final_ttft_ms = Some(n);
+                        }
+                    }
+                }
+            }
+            // 5. 再次兜底使用生效端点尝试的 duration_s
+            if final_ttft_ms.is_none() {
+                if let Some(attempts) = &attempts_for_stream {
+                    if let Some(eff) = attempts.iter().find(|a| a.is_effective) {
+                        if eff.duration_s > 0.0 {
+                            final_ttft_ms = Some(eff.duration_s * 1000.0);
+                        }
+                    }
+                }
+            }
+
+            // 回填真实 TTFT 到响应头，彻底消除 -1.000
+            if let Some(ttft_ms) = final_ttft_ms {
+                headers_map.insert(
+                    "x-timing-ttft-ms".to_string(),
+                    serde_json::json!(format!("{:.3}", ttft_ms)),
+                );
+                if let Some(ref mut attempts) = attempts_for_stream {
+                    if let Some(eff) = attempts.iter_mut().find(|a| a.is_effective) {
+                        eff.duration_s = ttft_ms / 1000.0;
+                    }
+                }
+            } else if headers_map
+                .get("x-timing-ttft-ms")
+                .and_then(|v| v.as_str())
+                .map_or(false, |s| s.starts_with('-'))
+            {
+                headers_map.remove("x-timing-ttft-ms");
+            }
 
             headers_map.insert(
                 "x-timing-stream-ms".to_string(),
@@ -1262,6 +1683,7 @@ pub async fn monitor_middleware(
                             log.cached_tokens = log.cached_tokens.or(cached_tokens);
                             reasoning_tokens =
                                 reasoning_tokens.or_else(|| extract_reasoning_tokens(usage));
+                            log.reasoning_tokens = log.reasoning_tokens.or(reasoning_tokens);
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -1297,9 +1719,47 @@ pub async fn monitor_middleware(
                         timing_obj.insert("thinking_s".to_string(), serde_json::json!(n / 1000.0));
                     }
                 }
-                if let Some(ttft) = headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str()) {
+                let mut ttft_val = 0.0;
+                if let Some(ttft_ms) = final_ttft_ms {
+                    ttft_val = ttft_ms / 1000.0;
+                    timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                } else if let Some(ttft) =
+                    headers_map.get("x-timing-ttft-ms").and_then(|v| v.as_str())
+                {
                     if let Ok(n) = ttft.parse::<f64>() {
-                        timing_obj.insert("ttft_s".to_string(), serde_json::json!(n / 1000.0));
+                        if n > 0.0 {
+                            ttft_val = n / 1000.0;
+                            timing_obj.insert("ttft_s".to_string(), serde_json::json!(ttft_val));
+                        }
+                    }
+                }
+                if let Some(oh) = headers_map
+                    .get("x-timing-ttft-overhead-ms")
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(n) = oh.parse::<f64>() {
+                        let overhead_s = n / 1000.0;
+                        if overhead_s > 0.0 {
+                            timing_obj.insert(
+                                "ttft_overhead_s".to_string(),
+                                serde_json::json!(overhead_s),
+                            );
+                            if ttft_val > 0.0 {
+                                timing_obj.insert(
+                                    "ttft_total_wait_s".to_string(),
+                                    serde_json::json!(ttft_val + overhead_s),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                if let Some(attempts) = attempts_for_stream {
+                    if !attempts.is_empty() {
+                        timing_obj.insert(
+                            "ttft_attempts".to_string(),
+                            serde_json::to_value(&attempts).unwrap_or(serde_json::Value::Null),
+                        );
                     }
                 }
                 timing_obj.insert(
@@ -1467,6 +1927,16 @@ pub async fn monitor_middleware(
                 }
             }
 
+            // [Cache-Opt:Settling Delay] 记录巨型冷请求完成（构建了未命中的大体积新 KV Cache）
+            if let Some(sid) = log.session_id.as_deref().filter(|s| !s.is_empty()) {
+                let in_toks = log.input_tokens.unwrap_or(0);
+                let cached_toks = log.cached_tokens.unwrap_or(0);
+                if in_toks >= 16_000 && cached_toks == 0 && log.status == 200 {
+                    crate::proxy::cache_manager::global_cache_manager()
+                        .record_heavy_miss_completion(sid, in_toks);
+                }
+            }
+
             // Record User Token Usage
             record_user_token_usage(&user_token_identity, &log, user_agent.clone());
 
@@ -1491,6 +1961,10 @@ pub async fn monitor_middleware(
             "x-timing-total-ms".to_string(),
             serde_json::json!(format!("{:.3}", total_ms)),
         );
+        headers_map.insert(
+            "x-timing-ttft-ms".to_string(),
+            serde_json::json!(format!("{:.3}", total_ms)),
+        );
         log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
         let (parts, body) = response.into_parts();
@@ -1509,6 +1983,9 @@ pub async fn monitor_middleware(
                             log.output_tokens = extract_output_tokens(usage);
                             log.cached_tokens =
                                 log.cached_tokens.or_else(|| extract_cached_tokens(usage));
+                            log.reasoning_tokens = log
+                                .reasoning_tokens
+                                .or_else(|| extract_reasoning_tokens(usage));
 
                             if log.input_tokens.is_none() && log.output_tokens.is_none() {
                                 log.output_tokens = usage
@@ -1526,14 +2003,19 @@ pub async fn monitor_middleware(
                             .or_else(|| Some(s.to_string()));
                     } else if let Ok(json) = serde_json::from_str::<Value>(&s) {
                         // 🌟 非流式响应入库统一转换为满血简要版 (包含网关权威签名回填与防雪崩确定性 Tool ID)
-                        if let Some(canonical) =
-                            consolidate_non_streaming_response(&json, &log, &headers_map)
-                        {
+                        if let Some(canonical) = consolidate_non_streaming_response(
+                            &json,
+                            &log,
+                            &headers_map,
+                            upstream_attempts.clone(),
+                        ) {
                             log.response_body = serde_json::to_string_pretty(&canonical)
                                 .ok()
                                 .or_else(|| Some(s.to_string()));
                         } else {
-                            log.response_body = Some(s.to_string());
+                            log.response_body = serde_json::to_string_pretty(&json)
+                                .ok()
+                                .or_else(|| Some(s.to_string()));
                         }
                     } else {
                         log.response_body = Some(s.to_string());
@@ -1563,6 +2045,16 @@ pub async fn monitor_middleware(
 
                 // Record User Token Usage
                 record_user_token_usage(&user_token_identity, &log, user_agent.clone());
+
+                // [Cache-Opt:Settling Delay] 记录巨型冷请求完成（构建了未命中的大体积新 KV Cache）
+                if let Some(sid) = log.session_id.as_deref().filter(|s| !s.is_empty()) {
+                    let in_toks = log.input_tokens.unwrap_or(0);
+                    let cached_toks = log.cached_tokens.unwrap_or(0);
+                    if in_toks >= 16_000 && cached_toks == 0 && log.status == 200 {
+                        crate::proxy::cache_manager::global_cache_manager()
+                            .record_heavy_miss_completion(sid, in_toks);
+                    }
+                }
 
                 monitor.log_request(log).await;
                 Response::from_parts(parts, Body::from(bytes))
@@ -1695,5 +2187,282 @@ mod tests {
         assert_eq!(super::extract_input_tokens(&usage), Some(10000));
         assert_eq!(super::extract_cached_tokens(&usage), Some(8800));
         assert_eq!(super::extract_output_tokens(&usage), Some(150));
+    }
+
+    #[test]
+    fn test_should_skip_request_log_only_suppresses_successful_get() {
+        use axum::http::StatusCode;
+
+        // 胶囊开关关闭（默认）：GET 成功请求一律不记录 —— 含 /v1/models 轮询（本次修复的核心场景）
+        // 与 /health 探针，且与路径无关（GET 成功即噪音）
+        for path in [
+            "/v1/models",
+            "/v1/models?limit=100",
+            "/v1beta/models",
+            "/v1/models/claude",
+            "/health",
+            "/healthz?t=123",
+            "/api/health/",
+            "/stats/overview",
+        ] {
+            for status in [200, 204, 201] {
+                assert!(
+                    super::should_skip_request_log(
+                        "GET",
+                        StatusCode::from_u16(status).unwrap(),
+                        false,
+                        None,
+                        None,
+                    ),
+                    "GET {status} {path} 应被抑制"
+                );
+            }
+        }
+
+        // 大写的 GET 同样识别
+        assert!(super::should_skip_request_log(
+            "get",
+            StatusCode::OK,
+            false,
+            None,
+            None
+        ));
+
+        // 失败请求始终记录（供排障）—— 无论路径与方法
+        for status in [400, 401, 403, 404, 429, 500, 502, 503, 504] {
+            assert!(
+                !super::should_skip_request_log(
+                    "GET",
+                    StatusCode::from_u16(status).unwrap(),
+                    false,
+                    None,
+                    None,
+                ),
+                "GET {status} 必须记录"
+            );
+        }
+
+        // 非探针的普通 POST 业务请求始终记录
+        for method in ["POST", "PUT", "PATCH", "DELETE", "post"] {
+            assert!(
+                !super::should_skip_request_log(method, StatusCode::OK, false, None, None,),
+                "{method} 200 必须记录"
+            );
+        }
+
+        // 开关开启（或 ABV_LOG_HEALTH_CHECKS=true）→ 全部记录并落库
+        for (method, status) in [("GET", 200), ("GET", 503), ("POST", 200)] {
+            assert!(
+                !super::should_skip_request_log(
+                    method,
+                    StatusCode::from_u16(status).unwrap(),
+                    true,
+                    None,
+                    None,
+                ),
+                "开关开启时 {method} {status} 必须记录"
+            );
+        }
+    }
+
+    #[test]
+    fn test_should_skip_request_log_third_party_gateway_probes() {
+        use axum::http::StatusCode;
+
+        // 1. 用户真实 NewAPI / OneAPI 典型探针报文 (原始 OpenAI / Claude 格式)
+        let raw_probe_openai = r#"{
+            "model": "gemini-3.8-flash-high",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "hi"
+                }
+            ],
+            "tools": [],
+            "max_tokens": 16
+        }"#;
+
+        // 2. 转换后的上游 Gemini 统一中转报文
+        let upstream_probe_gemini = r#"{
+            "requestId": "agent/76533e612681bbc3/1792560854720/687cf1c1/1",
+            "sessionId": "4698154524659342629",
+            "model": "gemini-3.8-flash-high",
+            "generationConfig": {
+                "maxOutputTokens": 65536,
+                "thinkingConfig": {
+                    "includeThoughts": true,
+                    "thinkingBudget": -1
+                }
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": "hi"
+                        }
+                    ]
+                }
+            ],
+            "safetySettings": []
+        }"#;
+
+        // 默认关闭开关 (capture_enabled = false) 时，成功探针请求必须被跳过过滤
+        assert!(
+            super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                Some(raw_probe_openai),
+                Some(upstream_probe_gemini),
+            ),
+            "成功的 POST 探针请求在开关关闭时必须被抑制"
+        );
+
+        // 即使仅有上游报文，也能协议无关精准识别并跳过
+        assert!(
+            super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                None,
+                Some(upstream_probe_gemini),
+            ),
+            "仅基于上游 Gemini 探针报文在开关关闭时必须被抑制"
+        );
+
+        // 即使仅有客户端原始报文，也能兜底识别并跳过
+        assert!(
+            super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                Some(raw_probe_openai),
+                None,
+            ),
+            "仅基于客户端原始报文在开关关闭时必须被抑制"
+        );
+
+        // 各种常见探针测试词汇变体均应被识别
+        for probe_word in [
+            "hello",
+            "ping",
+            "test",
+            "你好",
+            "您好",
+            "在吗",
+            "1+1=?",
+            "1+1",
+            "1 + 1 = 2",
+            "check",
+            "health",
+        ] {
+            let raw_var = format!(
+                r#"{{"model": "test", "messages": [{{"role": "user", "content": "{}"}}]}}"#,
+                probe_word
+            );
+            assert!(
+                super::should_skip_request_log("POST", StatusCode::OK, false, Some(&raw_var), None,),
+                "探针词 '{probe_word}' 应该被识别并抑制"
+            );
+        }
+
+        // 🌟 核心要求：“报错还是要显示”
+        // 即使是探针请求，只要状态码非 2xx（例如 400, 401, 403, 429, 500, 502, 503 等），绝不可跳过！
+        for err_status in [400, 401, 403, 404, 429, 500, 502, 503, 504] {
+            assert!(
+                !super::should_skip_request_log(
+                    "POST",
+                    StatusCode::from_u16(err_status).unwrap(),
+                    false,
+                    Some(raw_probe_openai),
+                    Some(upstream_probe_gemini),
+                ),
+                "状态码 {err_status} 失败的探针请求必须记录并展示报错"
+            );
+        }
+
+        // 🌟 核心要求：当开启“捕获健康检查”时，成功的探针请求也必须全部记录并落库
+        assert!(
+            !super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                true,
+                Some(raw_probe_openai),
+                Some(upstream_probe_gemini),
+            ),
+            "开启捕获健康检查时必须记录成功的探针"
+        );
+
+        // 🌟 防误杀：非探针的正常业务请求绝对不能被过滤
+        // 1. 多轮对话
+        let multi_turn_req = r#"{
+            "model": "gemini-3.8-flash",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "how are you"}
+            ]
+        }"#;
+        assert!(
+            !super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                Some(multi_turn_req),
+                None
+            ),
+            "多轮对话绝不可被误杀"
+        );
+
+        // 2. 带系统提示词 (system prompt)
+        let with_system_req = r#"{
+            "model": "gemini-3.8-flash",
+            "system": "You are a helpful coding assistant.",
+            "messages": [{"role": "user", "content": "hi"}]
+        }"#;
+        assert!(
+            !super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                Some(with_system_req),
+                None
+            ),
+            "带系统提示词的请求绝不可被误杀"
+        );
+
+        // 3. 带工具 (tools)
+        let with_tools_req = r#"{
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "calculator"}}]
+        }"#;
+        assert!(
+            !super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                Some(with_tools_req),
+                None
+            ),
+            "带工具调用的请求绝不可被误杀"
+        );
+
+        // 4. 真实用户问题（即使很简短但非探针词）
+        let real_question_req = r#"{
+            "model": "gemini-3.8-flash",
+            "messages": [{"role": "user", "content": "hi how are you today"}]
+        }"#;
+        assert!(
+            !super::should_skip_request_log(
+                "POST",
+                StatusCode::OK,
+                false,
+                Some(real_question_req),
+                None
+            ),
+            "真实用户问答绝不可被误杀"
+        );
     }
 }

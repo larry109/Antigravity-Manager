@@ -24,42 +24,46 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import {
     GripVertical,
-    ArrowRightLeft,
     RefreshCw,
-    Trash2,
-    Download,
-    Fingerprint,
-    Info,
     Lock,
     Ban,
     Diamond,
     Gem,
     Circle,
-    ToggleLeft,
-    ToggleRight,
     Sparkles,
     Tag,
-    X,
-    Check,
     Clock,
-    Bot,
-    Repeat2,
-    Terminal,
     ArrowUpDown,
     ArrowUp,
     ArrowDown,
+    Zap,
+    Power,
+    MoreHorizontal,
+    BookCopy,
+    Check,
+    Trash2,
+    X,
 } from 'lucide-react';
-import { type Account, type ModelQuota, getAccountTier } from '../../types/account';
+import { type Account, type ActiveClientsStatus, getAccountTier, getEffectiveModelPriority, hasAccountFlagshipCapability, hasCustomModelPriorities } from '../../types/account';
 import { useTranslation } from 'react-i18next';
 import { cn } from '../../utils/cn';
 
 import { useConfigStore } from '../../stores/useConfigStore';
-import { QuotaItem } from './QuotaItem';
-import { getModelQuotaDisplay } from '../../utils/quotaDisplay';
-import { MODEL_CONFIG, sortModels, resolveQuotaModels, ensurePinnedImageSelector } from '../../config/modelConfig';
-import { categorizeModel, getModelProtectionKey } from '../../utils/modelCategory';
+import { useAccountStore } from '../../stores/useAccountStore';
+import { usePedalModeStore } from '../../stores/usePedalModeStore';
+import { GroupQuotaCard } from './GroupQuotaCard';
+import { getGroupQuotaSummaries } from '../../utils/quotaDisplay';
 import { getValidationBlockedStatusLabel } from './accountValidationStatus';
+import { showToast } from '../common/ToastContainer';
+import { exportAccounts, releaseAccountQoSJail } from '../../services/accountService';
+import { copyToClipboard } from '../../utils/clipboard';
+import AccountSwitchMenu from './AccountSwitchMenu';
+import { QoSStatusBadge } from './QoSStatusBadge';
 import { getLiveLimitForModel } from '../../utils/liveLimit';
+import { isValidationBlockActive } from '../../utils/accountStatus';
+import { parseTags } from '../../utils/tagUtils';
+import { isFlagshipModel, extractGemini4Codename } from '../../utils/modelCategory';
+import AccountActionsModal from './AccountActionsModal';
 
 // ============================================================================
 // 类型定义
@@ -72,6 +76,7 @@ interface AccountTableProps {
     onToggleSelect: (id: string) => void;
     onToggleAll: () => void;
     currentAccountId: string | null;
+    activeClients?: ActiveClientsStatus;
     switchingAccountId: string | null;
     onSwitch: (accountId: string, targetIde?: string) => void;
     onRefresh: (accountId: string) => void;
@@ -85,7 +90,6 @@ interface AccountTableProps {
     /** 拖拽排序回调，当用户完成拖拽时触发 */
     onReorder?: (accountIds: string[]) => void;
     onViewError: (accountId: string) => void;
-    quotaWindow?: '5h' | 'weekly';
 }
 
 interface SortableRowProps {
@@ -93,6 +97,7 @@ interface SortableRowProps {
     selected: boolean;
     isRefreshing: boolean;
     isCurrent: boolean;
+    activeClients?: ActiveClientsStatus;
     isSwitching: boolean;
     isDragging?: boolean;
     onSelect: () => void;
@@ -106,13 +111,13 @@ interface SortableRowProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
-    quotaWindow?: '5h' | 'weekly';
     isDragDisabled?: boolean;
 }
 
 interface AccountRowContentProps {
     account: Account;
     isCurrent: boolean;
+    activeClients?: ActiveClientsStatus;
     isRefreshing: boolean;
     isSwitching: boolean;
     isDisabled: boolean;
@@ -126,68 +131,50 @@ interface AccountRowContentProps {
     onWarmup?: () => void;
     onUpdateLabel?: (label: string) => void;
     onViewError: () => void;
-    quotaWindow?: '5h' | 'weekly';
 }
 
 // ============================================================================
 // 辅助函数
 // ============================================================================
 
-
-
-function isModelProtected(protectedModels: string[] | undefined, modelName: string): boolean {
+function isGroupProtected(protectedModels: string[] | undefined, groupKey: 'gemini' | 'claude' | 'argon'): boolean {
     if (!protectedModels || protectedModels.length === 0) return false;
-    const lowerName = modelName.toLowerCase();
-
-    if (lowerName === 'gemini-pro') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-pro' && getModelProtectionKey(model) === 'gemini-3-pro-high',
-        );
+    if (groupKey === 'argon') {
+        return protectedModels.some(isFlagshipModel);
+    } else if (groupKey === 'gemini') {
+        return protectedModels.some(m => m.toLowerCase().startsWith('gemini') && !isFlagshipModel(m));
+    } else {
+        return protectedModels.some(m => m.toLowerCase().startsWith('claude') || m.toLowerCase().startsWith('gpt'));
     }
-    if (lowerName === 'gemini-flash') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'gemini-flash' && getModelProtectionKey(model) === 'gemini-3-flash',
-        );
-    }
-    if (lowerName === 'claude-sonnet') {
-        return protectedModels.some((model) =>
-            categorizeModel(model) === 'claude' && getModelProtectionKey(model) === 'claude',
-        );
-    }
-
-    const protectionKey = getModelProtectionKey(lowerName);
-    return protectionKey ? protectedModels.includes(protectionKey) : false;
 }
 
 /**
  * 提取账号的最快配额重置时间（毫秒时间戳）
  * 用于表格排序
  */
-function extractAccountResetTime(account: Account, quotaWindow?: '5h' | 'weekly'): number | null {
+function extractAccountResetTime(account: Account): number | null {
     let earliestTime: number | null = null;
 
-    if (quotaWindow === 'weekly') {
-        const groups = account.quota?.quota_groups || [];
-        for (const group of groups) {
-            for (const bucket of group.buckets || []) {
-                const isWeekly = bucket.window.toLowerCase().includes('week') || bucket.bucket_id.toLowerCase().includes('week');
-                if (isWeekly && bucket.reset_time) {
-                    const t = new Date(bucket.reset_time).getTime();
-                    if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
-                        earliestTime = t;
-                    }
-                }
-            }
-        }
-    } else {
-        // 5h 或常规视图下，从 models 中获取最近的 reset_time
-        const models = account.quota?.models || [];
-        for (const model of models) {
-            if (model.reset_time) {
-                const t = new Date(model.reset_time).getTime();
+    // 优先从 quota_groups 的各个 bucket 获取最早重置时间
+    const groups = account.quota?.quota_groups || [];
+    for (const group of groups) {
+        for (const bucket of group.buckets || []) {
+            if (bucket.reset_time) {
+                const t = new Date(bucket.reset_time).getTime();
                 if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
                     earliestTime = t;
                 }
+            }
+        }
+    }
+
+    // 也遍历 models 获取最早重置时间作为补充
+    const models = account.quota?.models || [];
+    for (const model of models) {
+        if (model.reset_time) {
+            const t = new Date(model.reset_time).getTime();
+            if (!isNaN(t) && (earliestTime === null || t < earliestTime)) {
+                earliestTime = t;
             }
         }
     }
@@ -208,6 +195,7 @@ function SortableAccountRow({
     selected,
     isRefreshing,
     isCurrent,
+    activeClients,
     isSwitching,
     isDragging,
     onSelect,
@@ -221,7 +209,6 @@ function SortableAccountRow({
     onWarmup,
     onUpdateLabel,
     onViewError,
-    quotaWindow,
     isDragDisabled = false,
 }: SortableRowProps) {
     const { t } = useTranslation();
@@ -241,15 +228,26 @@ function SortableAccountRow({
         zIndex: isSortableDragging ? 1000 : 'auto',
     };
 
+    const isClassic = activeClients?.classic_account_id === account.id;
+    const isIde = activeClients?.ide_account_id === account.id;
+    const isAgy = activeClients?.agy_account_id === account.id;
+    const isAcp = activeClients?.acp_account_id === account.id;
+    const isRowCurrent = isCurrent || isClassic || isIde || isAgy || isAcp;
+
+    const { active: isPedalActive, targetAccountIds } = usePedalModeStore();
+    const isPedaling = isPedalActive && targetAccountIds.includes(account.id);
+
     return (
         <tr
             ref={setNodeRef}
             style={style as React.CSSProperties}
             className={cn(
                 "group transition-colors border-b border-gray-100 dark:border-base-200",
-                isCurrent && "bg-blue-50/50 dark:bg-blue-900/10",
+                isPedaling && "bg-amber-50/50 dark:bg-amber-950/20 border-l-4 border-l-amber-500",
+                !isPedaling && isRowCurrent && "bg-blue-50/50 dark:bg-blue-900/10",
                 isDragging && "bg-blue-100 dark:bg-blue-900/30 shadow-lg",
-                !isDragging && "hover:bg-gray-50 dark:hover:bg-base-200"
+                !isDragging && !isPedaling && "hover:bg-gray-50 dark:hover:bg-base-200",
+                !isDragging && isPedaling && "hover:bg-amber-50/80 dark:hover:bg-amber-950/30"
             )}
         >
             {/* 拖拽手柄 */}
@@ -281,6 +279,7 @@ function SortableAccountRow({
             <AccountRowContent
                 account={account}
                 isCurrent={isCurrent}
+                activeClients={activeClients}
                 isRefreshing={isRefreshing}
                 isSwitching={isSwitching}
                 isDisabled={Boolean(account.disabled)}
@@ -294,7 +293,6 @@ function SortableAccountRow({
                 onWarmup={onWarmup}
                 onUpdateLabel={onUpdateLabel}
                 onViewError={onViewError}
-                quotaWindow={quotaWindow}
             />
         </tr>
     );
@@ -307,6 +305,7 @@ function SortableAccountRow({
 function AccountRowContent({
     account,
     isCurrent,
+    activeClients,
     isRefreshing,
     isSwitching,
     isDisabled,
@@ -320,133 +319,147 @@ function AccountRowContent({
     onWarmup,
     onUpdateLabel,
     onViewError,
-    quotaWindow,
 }: AccountRowContentProps) {
     const { t } = useTranslation();
-    const { config, showAllQuotas } = useConfigStore();
+    const { config } = useConfigStore();
+    const { active: isPedalActive, targetAccountIds } = usePedalModeStore();
+    const isPedaling = isPedalActive && targetAccountIds.includes(account.id);
+    const isValidationBlocked = isValidationBlockActive(account);
     const validationBlockedLabel = getValidationBlockedStatusLabel(account.validation_blocked_reason, t);
+    const isBanned = Boolean(account.banned);
 
-    // 自定义标签编辑状态
-    const [isEditingLabel, setIsEditingLabel] = useState(false);
-    const [labelInput, setLabelInput] = useState(account.custom_label || '');
+    const [isActionsModalOpen, setIsActionsModalOpen] = useState(false);
+    const [isCopied, setIsCopied] = useState(false);
 
-    const handleSaveLabel = () => {
-        if (onUpdateLabel) {
-            onUpdateLabel(labelInput.trim());
-        }
-        setIsEditingLabel(false);
-    };
-
-    const handleCancelLabel = () => {
-        setLabelInput(account.custom_label || '');
-        setIsEditingLabel(false);
-    };
-
-    const handleKeyDown = (e: React.KeyboardEvent) => {
-        if (e.key === 'Enter') {
-            handleSaveLabel();
-        } else if (e.key === 'Escape') {
-            handleCancelLabel();
-        }
-    };
-
-    // 解析周配额项 (当处于 weekly 视图时)
-    const weeklyItems = useMemo(() => {
-        if (quotaWindow !== 'weekly') return [];
-        return (account.quota?.quota_groups || []).flatMap(group => {
-            return group.buckets
-                .filter(b => b.window.toLowerCase().includes('week') || b.bucket_id.toLowerCase().includes('week'))
-                .map(b => {
-                    const shortGroupName = group.display_name
-                        .replace(/ models?$/i, '')
-                        .replace(/Claude and GPT/i, 'Claude/GPT');
-                    return {
-                        id: `${group.display_name}-${b.bucket_id}`,
-                        label: b.display_name ? `${shortGroupName} (${b.display_name})` : `${shortGroupName} (周)`,
-                        percentage: Math.round((b.remaining_fraction || 0) * 100),
-                        resetTime: b.reset_time,
-                        cycleTokens: b.cycle_tokens,
-                        Icon: shortGroupName.toLowerCase().includes('claude') ? Sparkles : Bot,
-                    };
-                });
-        });
-    }, [quotaWindow, account.quota?.quota_groups]);
-
-    // 获取要显示的模型列表
-    const pinnedModels = ensurePinnedImageSelector(
-        config?.pinned_quota_models?.models || Object.keys(MODEL_CONFIG),
-    );
-
-    // 根据 show_all 状态决定显示哪些模型
-    const uniqueLabels = new Set<string>();
-    const displayModels = sortModels(
-        (showAllQuotas
-            ? (account.quota?.models || []).map(m => {
-                const config = MODEL_CONFIG[m.name.toLowerCase()];
-                const label = m.display_name || (config?.i18nKey ? t(config.i18nKey) : (config?.shortLabel || config?.label || m.name));
-                return {
-                    id: m.name.toLowerCase(),
-                    label: label,
-                    protectedKey: config?.protectedKey || m.name.toLowerCase(),
-                    data: m
-                };
-            })
-            : resolveQuotaModels(account.quota?.models, pinnedModels).map(sel => {
-                const selectorConfig = MODEL_CONFIG[sel.selectorId.toLowerCase()];
-                const resolvedConfig = sel.model ? MODEL_CONFIG[sel.model.name.toLowerCase()] : undefined;
-                if (!selectorConfig && !sel.model) return null;
-                const label = sel.model?.display_name
-                    || (resolvedConfig?.shortLabel || resolvedConfig?.label)
-                    || (selectorConfig?.shortLabel || selectorConfig?.label)
-                    || (resolvedConfig?.i18nKey ? t(resolvedConfig.i18nKey) : undefined)
-                    || (selectorConfig?.i18nKey ? t(selectorConfig.i18nKey) : undefined)
-                    || sel.selectorId;
-                return {
-                    id: sel.model?.name.toLowerCase() ?? sel.selectorId.toLowerCase(),
-                    label,
-                    protectedKey: getModelProtectionKey(sel.model?.name ?? sel.selectorId) ?? resolvedConfig?.protectedKey ?? selectorConfig?.protectedKey ?? sel.selectorId,
-                    data: sel.model,
-                };
-            }).filter((item): item is { id: string; label: string; protectedKey: string; data: ModelQuota | undefined } => item !== null)
-    ).filter(m => {
-            // 过滤特定的 Claude/Gemini 思考变体 (在列表页隐藏)
-            const isHiddenThinking = m.id.includes('thinking');
-
-            if (isHiddenThinking) return false;
-
-            // 基于标签去重 (例如 G3.1 Pro 只显示一次)
-            // 优先显示有配额数据的 ID
-            const labelKey = `${m.label}-${m.protectedKey}`;
-            if (uniqueLabels.has(labelKey)) {
-                return false;
+    const handleCopyCredentials = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        try {
+            const response = await exportAccounts([account.id]);
+            if (response.accounts && response.accounts.length > 0) {
+                const content = JSON.stringify(response.accounts, null, 2);
+                const ok = await copyToClipboard(content);
+                if (ok) {
+                    setIsCopied(true);
+                    showToast(t('accounts.credentials_copied', '账号凭据已复制到剪贴板'), 'success');
+                    setTimeout(() => setIsCopied(false), 1500);
+                }
+            } else {
+                showToast(t('accounts.no_credentials_found', '未获取到账号凭据'), 'warning');
             }
-            if (m.data) {
-                uniqueLabels.add(labelKey);
-                return true;
-            }
-            return true;
-        })
-    ).filter((m, index, self) => {
-        // 第二次过滤：确保即使没有数据的重复 Label 也只保留一个
-        const labelKey = `${m.label}-${m.protectedKey}`;
-        return self.findIndex(t => `${t.label}-${t.protectedKey}` === labelKey) === index;
-    });
+        } catch (err) {
+            showToast(`${t('common.error')}: ${err}`, 'error');
+        }
+    };
 
+    const isClassic = activeClients?.classic_account_id === account.id;
+    const isIde = activeClients?.ide_account_id === account.id;
+    const isAgy = activeClients?.agy_account_id === account.id;
+    const isAcp = activeClients?.acp_account_id === account.id;
+    const isRowActive = isCurrent || isClassic || isIde || isAgy || isAcp;
+
+    const tags = useMemo(() => parseTags(account.custom_label), [account.custom_label]);
+
+    const handleReleaseJail = async () => {
+        try {
+            await releaseAccountQoSJail(account.id);
+            showToast(t('accounts.qos.release_success', '已解除该账号的小黑屋限制'), 'success');
+            // 解除小黑屋只影响运行时 QoS 状态，与配额无关：直接重拉账号列表立即回显。
+            // 若复用 onRefresh 的配额刷新链路，上游 429/503 时 fetchAccountQuota 会抛错，
+            // 列表刷新被跳过，界面上的「限速小黑屋中」徽章就会一直残留。
+            await useAccountStore.getState().fetchAccounts();
+        } catch (err: any) {
+            showToast(err?.message || '解除失败', 'error');
+        }
+    };
+
+    const tier = useMemo(() => getAccountTier(account), [account]);
+    const groupSummaries = useMemo(() => {
+        return getGroupQuotaSummaries(account.quota?.quota_groups, account.quota?.models, tier);
+    }, [account.quota?.quota_groups, account.quota?.models, tier]);
+
+    const modelCapabilities = useMemo(() => {
+        const supported = Array.from(new Set(groupSummaries.flatMap(s => s.supportedModels || [])));
+        const hasFlagship = hasAccountFlagshipCapability(account) || groupSummaries.some(s => s.key === 'argon') || supported.some(isFlagshipModel);
+        const flagshipCode = supported.map(extractGemini4Codename).find(Boolean) || (hasFlagship ? 'neon' : null);
+        const flagshipLabel = flagshipCode ? flagshipCode.charAt(0).toUpperCase() + flagshipCode.slice(1) : 'Neon';
+        const hasClaude55 = supported.some(m => m.includes('5-5') || m.includes('5.5'));
+        const hasClaude46 = supported.some(m => m.includes('4-6') || m.includes('4.6'));
+        const hasGpt = supported.some(m => m.startsWith('gpt'));
+        const hasGemini38 = supported.some(m => m.includes('3.8') || m.includes('3-8'));
+        return { hasArgon: hasFlagship, flagshipLabel, hasClaude55, hasClaude46, hasGpt, hasGemini38, supportedCount: supported.length };
+    }, [account, groupSummaries]);
 
     return (
         <>
             {/* 邮箱列 */}
-            <td className="px-2 py-1 align-middle">
-                <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                    <span className={cn(
-                        "font-medium text-sm break-all transition-colors",
-                        isCurrent ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
-                    )} title={account.email}>
-                        {account.email}
-                    </span>
+            <td className="px-2 py-1.5 align-middle max-w-[320px]">
+                <div className="flex flex-col gap-1 min-w-0">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                        <span className={cn(
+                            "font-medium text-sm break-all transition-colors",
+                            isRowActive ? "text-blue-700 dark:text-blue-400" : "text-gray-900 dark:text-base-content"
+                        )} title={account.email}>
+                            {account.email}
+                        </span>
+                        <button
+                            type="button"
+                            onClick={handleCopyCredentials}
+                            className="p-1 rounded hover:bg-gray-100 dark:hover:bg-base-200 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 transition-colors shrink-0"
+                            title={t('accounts.copy_credentials_tooltip', '复制账号凭据 (JSON)')}
+                        >
+                            {isCopied ? (
+                                <Check className="w-3.5 h-3.5 text-emerald-500" />
+                            ) : (
+                                <BookCopy className="w-3.5 h-3.5" />
+                            )}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onDelete();
+                            }}
+                            className="p-1 rounded hover:bg-red-50 dark:hover:bg-red-950/30 text-gray-400 hover:text-red-600 dark:hover:text-red-400 transition-colors shrink-0"
+                            title={t('accounts.delete_account_tooltip', '删除此账号')}
+                        >
+                            <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                    </div>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
-                        {isCurrent && (
+                    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                        {isClassic && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-[10px] font-bold shadow-sm border border-blue-200/50 dark:border-blue-800/50"
+                                title={t('accounts.client_classic_tooltip', '当前 Antigravity 经典款客户端登录账号')}
+                            >
+                                {t('accounts.client_classic', '经典款')}
+                            </span>
+                        )}
+                        {isIde && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-sky-100 dark:bg-sky-900/50 text-sky-700 dark:text-sky-300 text-[10px] font-bold shadow-sm border border-sky-200/50 dark:border-sky-800/50"
+                                title={t('accounts.client_ide_tooltip', '当前 Antigravity IDE 客户端登录账号')}
+                            >
+                                {t('accounts.client_ide', 'IDE')}
+                            </span>
+                        )}
+                        {isAgy && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold shadow-sm border border-emerald-200/50 dark:border-emerald-800/50"
+                                title={t('accounts.client_cli_tooltip', '当前 Antigravity CLI (agy) 登录账号')}
+                            >
+                                {t('accounts.client_cli', 'CLI')}
+                            </span>
+                        )}
+                        {isAcp && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-violet-100 dark:bg-violet-900/50 text-violet-700 dark:text-violet-300 text-[10px] font-bold shadow-sm border border-violet-200/50 dark:border-violet-800/50"
+                                title={t('accounts.client_acp_tooltip', 'Active account in Antigravity IDE Plugin (ACP)')}
+                            >
+                                {t('accounts.client_acp', 'Plugin')}
+                            </span>
+                        )}
+                        {!isClassic && !isIde && !isAgy && !isAcp && isCurrent && (
                             <span className="px-2 py-0.5 rounded-md bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 text-[10px] font-bold shadow-sm border border-blue-200/50 dark:border-blue-800/50">
                                 {t('accounts.current').toUpperCase()}
                             </span>
@@ -460,7 +473,17 @@ function AccountRowContent({
                             </span>
                         )}
 
-                        {account.proxy_disabled && (
+                        {isBanned && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50"
+                                title={account.banned_reason || t('accounts.banned_tooltip', '账号已被上游封禁（违反服务条款），请提交申诉')}
+                            >
+                                <Ban className="w-2.5 h-2.5" />
+                                <span>{t('accounts.banned', '已封禁')}</span>
+                            </span>
+                        )}
+
+                        {account.proxy_disabled && !isDisabled && !isBanned && (
                             <span
                                 className="px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-orange-200/50"
                             >
@@ -469,18 +492,45 @@ function AccountRowContent({
                             </span>
                         )}
 
-                        {account.quota?.is_forbidden && (
+                        {account.quota?.is_forbidden && !isBanned && (
                             <span className="px-2 py-0.5 rounded-md bg-red-100 dark:bg-red-900/50 text-red-600 dark:text-red-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-red-200/50">
                                 <Lock className="w-2.5 h-2.5" />
                                 <span>{t('accounts.forbidden')}</span>
                             </span>
                         )}
-                        {account.validation_blocked && (
+                        {isValidationBlocked && (
                             <span className="px-2 py-0.5 rounded-md bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-400 text-[10px] font-bold flex items-center gap-1 shadow-sm border border-amber-200/50">
                                 <Clock className="w-2.5 h-2.5" />
                                 <span>{validationBlockedLabel}</span>
                             </span>
                         )}
+                        {account.forbidden_models && account.forbidden_models.length > 0 && (
+                            account.forbidden_models.map((fm) => (
+                                <button
+                                    key={fm}
+                                    type="button"
+                                    onClick={async (e) => {
+                                        e.stopPropagation();
+                                        try {
+                                            await useAccountStore.getState().removeForbiddenModel(account.id, fm);
+                                        } catch (err) {
+                                            console.error('Failed to unfreeze model:', err);
+                                        }
+                                    }}
+                                    className="group px-2 py-0.5 rounded-md bg-rose-100 hover:bg-rose-200 dark:bg-rose-950/40 dark:hover:bg-rose-900/60 text-rose-600 dark:text-rose-400 text-[10px] font-bold flex items-center gap-1 shadow-xs border border-rose-200/50 dark:border-rose-900/30 transition-colors cursor-pointer"
+                                    title={t('accounts.unfreeze_model_tooltip', '点击解除该模型的 403 冻结')}
+                                >
+                                    <span>❄️ {fm}</span>
+                                    <X className="w-2.5 h-2.5 opacity-60 group-hover:opacity-100 group-hover:text-rose-700 dark:group-hover:text-rose-300" />
+                                </button>
+                            ))
+                        )}
+                        <QoSStatusBadge
+                            status={account.qos_status}
+                            resetSeconds={account.qos_reset_seconds}
+                            size="md"
+                            onRelease={handleReleaseJail}
+                        />
 
 
                         {/* 订阅类型徽章 */}
@@ -491,6 +541,13 @@ function AccountRowContent({
                                     <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-purple-600 to-pink-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default">
                                         <Gem className="w-2.5 h-2.5 fill-current" />
                                         {t('accounts.ultra')}
+                                    </span>
+                                );
+                            } else if (tier === 'enterprise') {
+                                return (
+                                    <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-emerald-600 to-teal-600 text-white text-[10px] font-bold shadow-sm hover:scale-105 transition-transform cursor-default" title={account.token?.project_id ? `GCP Project: ${account.token.project_id}` : 'GCP / Vertex AI Enterprise'}>
+                                        <Diamond className="w-2.5 h-2.5 fill-current" />
+                                        ENTERPRISE
                                     </span>
                                 );
                             } else if (tier === 'pro') {
@@ -509,40 +566,82 @@ function AccountRowContent({
                                 );
                             }
                         })()}
-                        {/* 自定义标签 */}
-                        {account.custom_label && !isEditingLabel && (
-                            <span className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-orange-100 dark:bg-orange-900/40 text-orange-700 dark:text-orange-300 text-[10px] font-bold shadow-sm border border-orange-200/50 dark:border-orange-800/50">
-                                <Tag className="w-2.5 h-2.5" />
-                                {account.custom_label}
+                        {/* 蹬额度中高亮徽章 */}
+                        {isPedaling && (
+                            <span
+                                className="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-800 dark:text-amber-300 text-[10px] font-bold flex items-center gap-1 shadow-xs border border-amber-500/40 animate-pulse motion-reduce:animate-none"
+                                title={t('pedal.account_pedaling_tooltip', '该账号当前处于蹬额度模式，已被设为最高调度优先级 (priority = 1)')}
+                            >
+                                <Zap className="w-2.5 h-2.5 fill-current text-amber-500" />
+                                {t('pedal.account_pedaling_badge', '⚡ 蹬额度中')}
                             </span>
                         )}
-                        {/* 标签编辑输入框 */}
-                        {isEditingLabel && (
-                            <div className="flex items-center gap-1">
-                                <input
-                                    type="text"
-                                    className="px-1.5 py-0.5 text-[10px] w-20 border border-orange-300 dark:border-orange-700 rounded focus:outline-none focus:ring-1 focus:ring-orange-500 bg-white dark:bg-base-200"
-                                    placeholder={t('accounts.custom_label_placeholder', 'Label')}
-                                    value={labelInput}
-                                    onChange={(e) => setLabelInput(e.target.value)}
-                                    onKeyDown={handleKeyDown}
-                                    autoFocus
-                                    maxLength={15}
-                                    onClick={(e) => e.stopPropagation()}
-                                />
-                                <button
-                                    className="p-0.5 text-green-600 hover:bg-green-50 dark:hover:bg-green-900/30 rounded transition-all"
-                                    onClick={(e) => { e.stopPropagation(); handleSaveLabel(); }}
-                                >
-                                    <Check className="w-3 h-3" />
-                                </button>
-                                <button
-                                    className="p-0.5 text-gray-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded transition-all"
-                                    onClick={(e) => { e.stopPropagation(); handleCancelLabel(); }}
-                                >
-                                    <X className="w-3 h-3" />
-                                </button>
-                            </div>
+                        {/* 优先级 */}
+                        <span
+                            className={cn(
+                                "px-2 py-0.5 rounded-md text-[10px] font-bold",
+                                isPedaling
+                                    ? "bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 border border-amber-300/80 dark:border-amber-700/80 shadow-2xs"
+                                    : hasCustomModelPriorities(account)
+                                        ? "bg-indigo-50 dark:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 border border-indigo-200/60 dark:border-indigo-800/50"
+                                        : "bg-gray-100 dark:bg-base-300 text-gray-500 dark:text-gray-400"
+                            )}
+                            title={
+                                hasCustomModelPriorities(account)
+                                    ? `Gemini: ${getEffectiveModelPriority(account, 'gemini')} | Claude: ${getEffectiveModelPriority(account, 'claude')} (${t('accounts.priority')}: ${account.priority ?? 50})`
+                                    : t('accounts.priority_hint')
+                            }
+                        >
+                            {hasCustomModelPriorities(account)
+                                ? `${t('accounts.priority')}: G:${getEffectiveModelPriority(account, 'gemini')} · C:${getEffectiveModelPriority(account, 'claude')}`
+                                : `${t('accounts.priority')}: ${account.priority ?? 50}`}
+                        </span>
+                        {/* 多标签平铺渲染 (最多显示 2 个，超出的显示 +N 徽章) */}
+                        {tags.length > 0 && (
+                            <>
+                                {tags.slice(0, 2).map((tag, idx) => (
+                                    <span key={`${tag}-${idx}`} className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-md font-bold bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300 border border-orange-200/50 dark:border-orange-800/50 shadow-sm">
+                                        <Tag className="w-2.5 h-2.5" />
+                                        {tag}
+                                    </span>
+                                ))}
+                                {tags.length > 2 && (
+                                    <span className="text-[10px] px-1.5 py-0.5 rounded-md text-gray-500 bg-gray-100 dark:bg-base-200 border border-gray-200 dark:border-base-300 font-bold" title={tags.slice(2).join(', ')}>
+                                        +{tags.length - 2}
+                                    </span>
+                                )}
+                            </>
+                        )}
+
+                        {/* 核心支持模型徽章栏 (直观展现该账号具体可用的旗舰模型代际) */}
+                        {modelCapabilities.hasArgon && (
+                            <span
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-gradient-to-r from-purple-500/15 to-indigo-500/15 text-purple-700 dark:text-purple-300 text-[10px] font-bold shadow-2xs border border-purple-200/60 dark:border-purple-800/50 cursor-default"
+                            >
+                                <Sparkles className="w-2.5 h-2.5 text-purple-500" />
+                                {modelCapabilities.flagshipLabel}
+                            </span>
+                        )}
+                        {modelCapabilities.hasClaude55 && (
+                            <span
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-500/15 text-amber-700 dark:text-amber-300 text-[10px] font-bold shadow-2xs border border-amber-200/60 dark:border-amber-800/50 cursor-default"
+                            >
+                                Claude 5.5
+                            </span>
+                        )}
+                        {modelCapabilities.hasClaude46 && !modelCapabilities.hasClaude55 && (
+                            <span
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-500/10 text-amber-600/90 dark:text-amber-400/90 text-[10px] font-bold shadow-2xs border border-amber-200/40 dark:border-amber-800/30 cursor-default"
+                            >
+                                Claude 4.6
+                            </span>
+                        )}
+                        {modelCapabilities.hasGpt && (
+                            <span
+                                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold shadow-2xs border border-emerald-200/60 dark:border-emerald-800/50 cursor-default"
+                            >
+                                GPT-120B
+                            </span>
                         )}
                     </div>
 
@@ -550,27 +649,27 @@ function AccountRowContent({
             </td>
 
             {/* 模型配额列 */}
-            <td className="px-2 py-1 align-middle">
-                {isDisabled || account.quota?.is_forbidden || account.validation_blocked ? (
+            <td className="px-3 py-2 align-middle">
+                {isDisabled || account.banned || account.quota?.is_forbidden || isValidationBlocked ? (
                     <div className={cn(
                         "flex items-center justify-center gap-3 py-1.5 px-4 rounded-xl border group/error",
-                        account.validation_blocked ? "bg-amber-50/50 dark:bg-amber-900/10 border-amber-100/50 dark:border-amber-900/20" : "bg-red-50/50 dark:bg-red-900/10 border-red-100/50 dark:border-red-900/20"
+                        isValidationBlocked && !account.banned ? "bg-amber-50/50 dark:bg-amber-900/10 border-amber-100/50 dark:border-amber-900/20" : "bg-red-50/50 dark:bg-red-900/10 border-red-100/50 dark:border-red-900/20"
                     )}>
                         <div className={cn(
                             "flex items-center gap-1.5",
-                            account.validation_blocked ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"
+                            isValidationBlocked && !account.banned ? "text-amber-600 dark:text-amber-400" : "text-red-600 dark:text-red-400"
                         )}>
-                            {account.validation_blocked ? <Clock className="w-3.5 h-3.5" /> : (account.quota?.is_forbidden ? <Lock className="w-3.5 h-3.5" /> : <Ban className="w-3.5 h-3.5" />)}
+                            {isValidationBlocked && !account.banned ? <Clock className="w-3.5 h-3.5" /> : (account.banned ? <Ban className="w-3.5 h-3.5" /> : (account.quota?.is_forbidden ? <Lock className="w-3.5 h-3.5" /> : <Ban className="w-3.5 h-3.5" />))}
                             <span className={cn(
                                 "text-[11px] font-bold",
-                                account.validation_blocked ? "text-amber-700/80 dark:text-amber-400" : "text-red-700/80 dark:text-red-400"
+                                isValidationBlocked && !account.banned ? "text-amber-700/80 dark:text-amber-400" : "text-red-700/80 dark:text-red-400"
                             )}>
-                                {account.validation_blocked ? validationBlockedLabel : (isDisabled ? t('accounts.status.disabled') : t('accounts.forbidden_msg'))}
+                                {isValidationBlocked && !account.banned ? validationBlockedLabel : (account.banned ? t('accounts.banned_msg', '账号已被上游封禁，已停止自动刷新') : (isDisabled ? t('accounts.status.disabled') : t('accounts.forbidden_msg')))}
                             </span>
                         </div>
                         <div className={cn(
                             "w-px h-3",
-                            account.validation_blocked ? "bg-amber-200 dark:bg-amber-800/50" : "bg-red-200 dark:bg-red-800/50"
+                            isValidationBlocked ? "bg-amber-200 dark:bg-amber-800/50" : "bg-red-200 dark:bg-red-800/50"
                         )} />
                         <button
                             onClick={(e) => { e.stopPropagation(); onViewError(); }}
@@ -580,40 +679,33 @@ function AccountRowContent({
                         </button>
                     </div>
                 ) : (
-                    <div className={cn(
-                        "grid gap-x-2 gap-y-1 py-0",
-                        (quotaWindow === 'weekly' && weeklyItems.length > 0)
-                            ? (weeklyItems.length === 1 ? "grid-cols-1" : "grid-cols-2")
-                            : (displayModels.length === 1 ? "grid-cols-1" : "grid-cols-2")
-                    )}>
-                        {quotaWindow === 'weekly' && weeklyItems.length > 0 ? (
-                            weeklyItems.map((item) => (
-                                <QuotaItem
-                                    key={item.id}
-                                    label={item.label}
-                                    percentage={item.percentage}
-                                    resetTime={item.resetTime}
-                                    weeklyTokens={item.cycleTokens ?? null}
-                                    Icon={item.Icon}
+                    <div className="flex flex-col gap-1.5 py-0.5">
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                            {groupSummaries.filter(s => s.key !== 'argon').map((summary) => (
+                                <GroupQuotaCard
+                                    key={summary.key}
+                                    summary={summary}
+                                    isProtected={Boolean(config?.quota_protection?.enabled && isGroupProtected(account.protected_models, summary.key))}
+                                    liveLimit={summary.key === 'gemini' ? getLiveLimitForModel(account, 'gemini-pro') : getLiveLimitForModel(account, 'claude')}
+                                    compact
                                 />
-                            ))
-                        ) : (
-                            displayModels.map((model) => {
-                                const modelData = model.data;
-                                const display = getModelQuotaDisplay(model.id, modelData, account.quota?.quota_groups);
-
-                                return (
-                                    <QuotaItem
-                                        key={model.id}
-                                        label={model.label}
-                                        {...display}
-                                        isProtected={Boolean(config?.quota_protection?.enabled && isModelProtected(account.protected_models, model.protectedKey))}
-                                        liveLimit={getLiveLimitForModel(account, model.id, model.protectedKey)}
-                                        Icon={MODEL_CONFIG[model.id]?.Icon || Bot}
+                            ))}
+                        </div>
+                        {(() => {
+                            const argon = groupSummaries.find(s => s.key === 'argon');
+                            if (!argon) return null;
+                            return (
+                                <div className="w-full pt-0.5">
+                                    <GroupQuotaCard
+                                        summary={argon}
+                                        isProtected={Boolean(config?.quota_protection?.enabled && isGroupProtected(account.protected_models, 'argon'))}
+                                        liveLimit={getLiveLimitForModel(account, 'gemini-4-neon') || getLiveLimitForModel(account, 'gemini-4-argon')}
+                                        compact
+                                        fullWidth
                                     />
-                                );
-                            })
-                        )}
+                                </div>
+                            );
+                        })()}
                     </div>
                 )}
             </td>
@@ -632,116 +724,95 @@ function AccountRowContent({
 
             {/* 操作列 */}
             <td className={cn(
-                "px-1 py-1 sticky right-0 z-10 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center align-middle",
+                "px-1 py-1 sticky right-0 w-[136px] min-w-[136px] max-w-[136px] z-10 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center align-middle",
                 // 动态背景色处理
                 isCurrent
                     ? "bg-[#f1f6ff] dark:bg-[#1e2330]" // 接近 blue-50/50 的实色
                     : "bg-white dark:bg-base-100",
                 !isCurrent && "group-hover:bg-gray-50 dark:group-hover:bg-base-200"
             )}>
-                <div className="flex flex-wrap items-center justify-center gap-1 opacity-60 group-hover:opacity-100 transition-opacity max-w-[220px] mx-auto">
-                    <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onViewDetails(); }}
-                        title={t('common.details')}
-                    >
-                        <Info className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onViewDevice(); }}
-                        title={t('accounts.device_fingerprint')}
-                    >
-                        <Fingerprint className="w-3.5 h-3.5" />
-                    </button>
-                    {/* 自定义标签按钮 */}
-                    {onUpdateLabel && (
-                        <button
-                            className={cn(
-                                "p-1.5 rounded-lg transition-all",
-                                account.custom_label
-                                    ? "text-orange-500 hover:text-orange-600 hover:bg-orange-50 dark:hover:bg-orange-900/30"
-                                    : "text-gray-500 dark:text-gray-400 hover:text-orange-500 hover:bg-orange-50 dark:hover:bg-orange-900/30"
-                            )}
-                            onClick={(e) => { e.stopPropagation(); setIsEditingLabel(true); }}
-                            title={t('accounts.edit_label', 'Edit Label')}
-                        >
-                            <Tag className="w-3.5 h-3.5" />
-                        </button>
-                    )}
-                    <button
-                        className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-blue-600 dark:hover:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch('classic'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)'))}
-                        disabled={isSwitching || isDisabled}
-                    >
-                        <ArrowRightLeft className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
-                    </button>
-                    <button
-                        className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-sky-600 dark:hover:text-sky-400 hover:bg-sky-50 dark:hover:bg-sky-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch('ide'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_ide', '切换到 Antigravity IDE'))}
-                        disabled={isSwitching || isDisabled}
-                    >
-                        <Repeat2 className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
-                    </button>
-                    <button
-                        className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isSwitching || isDisabled) ? 'bg-blue-50 dark:bg-blue-900/10 text-blue-600 dark:text-blue-400 cursor-not-allowed' : 'hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-emerald-50 dark:hover:bg-emerald-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onSwitch('agy'); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isSwitching ? t('common.loading') : t('accounts.switch_to_agy', '切换到 Antigravity CLI (agy)'))}
-                        disabled={isSwitching || isDisabled}
-                    >
-                        <Terminal className={`w-3.5 h-3.5 ${isSwitching ? 'animate-spin' : ''}`} />
-                    </button>
-                    {onWarmup && (
-                        <button
-                            className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isRefreshing || isDisabled) ? 'bg-orange-50 dark:bg-orange-900/10 text-orange-600 dark:text-orange-400 cursor-not-allowed' : 'hover:text-orange-500 dark:hover:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900/30'}`}
-                            onClick={(e) => { e.stopPropagation(); onWarmup(); }}
-                            title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.loading') : t('accounts.warmup_this', '预热该账号'))}
-                            disabled={isRefreshing || isDisabled}
-                        >
-                            <Sparkles className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-pulse' : ''}`} />
-                        </button>
-                    )}
-                    <button
-                        className={`p-1.5 text-gray-500 dark:text-gray-400 rounded-lg transition-all ${(isRefreshing || isDisabled) ? 'bg-green-50 dark:bg-green-900/10 text-green-600 dark:text-green-400 cursor-not-allowed' : 'hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30'}`}
-                        onClick={(e) => { e.stopPropagation(); onRefresh(); }}
-                        title={isDisabled ? t('accounts.disabled_tooltip') : (isRefreshing ? t('common.refreshing') : t('common.refresh'))}
-                        disabled={isRefreshing || isDisabled}
-                    >
-                        <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
-                    </button>
-                    <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onExport(); }}
-                        title={t('common.export')}
-                    >
-                        <Download className="w-3.5 h-3.5" />
-                    </button>
+                <div className="grid grid-cols-2 gap-1 w-full max-w-[128px] mx-auto">
+                    {/* 1. 切换（点击向上展开 4 个客户端微标选项） */}
+                    <AccountSwitchMenu
+                        accountId={account.id}
+                        disabled={Boolean(isDisabled || isBanned)}
+                        isSwitching={isSwitching}
+                        activeClients={activeClients}
+                        onSwitch={onSwitch}
+                        size="sm"
+                    />
+
+                    {/* 2. 刷新 */}
                     <button
                         className={cn(
-                            "p-1.5 rounded-lg transition-all",
-                            account.proxy_disabled
-                                ? "text-gray-500 dark:text-gray-400 hover:text-green-600 dark:hover:text-green-400 hover:bg-green-50 dark:hover:bg-green-900/30"
-                                : "text-gray-500 dark:text-gray-400 hover:text-orange-600 dark:hover:text-orange-400 hover:bg-orange-50 dark:hover:bg-orange-900/30"
+                            "flex items-center justify-center gap-0.5 px-1 py-1 rounded-lg text-xs font-semibold transition-all shadow-xs",
+                            (isRefreshing || isDisabled)
+                                ? "bg-gray-100 dark:bg-base-200 text-gray-400 dark:text-gray-500 cursor-not-allowed border border-gray-200 dark:border-base-300"
+                                : "bg-emerald-50 dark:bg-emerald-900/20 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/40 border border-emerald-200/60 dark:border-emerald-800/40 active:scale-95"
+                        )}
+                        onClick={(e) => { e.stopPropagation(); onRefresh(); }}
+                        disabled={isRefreshing || isDisabled}
+                        title={isDisabled ? t('accounts.disabled_tooltip') : t('accounts.refresh_quota_and_ban', '刷新配额并检测封禁')}
+                    >
+                        <RefreshCw className={cn("w-3 h-3 flex-shrink-0", isRefreshing && "animate-spin")} />
+                        <span className="truncate">{t('accounts.action_refresh', '刷新')}</span>
+                    </button>
+
+                    {/* 3. 启停 */}
+                    <button
+                        className={cn(
+                            "flex items-center justify-center gap-0.5 px-1 py-1 rounded-lg text-xs font-semibold transition-all shadow-xs",
+                            isBanned
+                                ? "bg-gray-100 dark:bg-base-200 text-gray-400 dark:text-gray-500 cursor-not-allowed border border-gray-200 dark:border-base-300"
+                                : account.proxy_disabled
+                                    ? "bg-amber-50 dark:bg-amber-900/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/40 border border-amber-200/60 dark:border-amber-800/40 active:scale-95"
+                                    : "bg-teal-50 dark:bg-teal-900/20 text-teal-600 dark:text-teal-400 hover:bg-teal-100 dark:hover:bg-teal-900/40 border border-teal-200/60 dark:border-teal-800/40 active:scale-95"
                         )}
                         onClick={(e) => { e.stopPropagation(); onToggleProxy(); }}
-                        title={account.proxy_disabled ? t('accounts.enable_proxy') : t('accounts.disable_proxy')}
+                        disabled={isBanned}
+                        title={isBanned ? t('accounts.banned_tooltip', '账号已被上游封禁（违反服务条款），请提交申诉') : (account.proxy_disabled ? t('accounts.enable_proxy') : t('accounts.disable_proxy'))}
                     >
-                        {account.proxy_disabled ? (
-                            <ToggleRight className="w-3.5 h-3.5" />
-                        ) : (
-                            <ToggleLeft className="w-3.5 h-3.5" />
-                        )}
+                        <Power className="w-3 h-3 flex-shrink-0" />
+                        <span className="truncate">
+                            {account.proxy_disabled ? t('accounts.action_enable', '启用') : t('accounts.action_disable', '停用')}
+                        </span>
                     </button>
+
+                    {/* 4. 更多 */}
                     <button
-                        className="p-1.5 text-gray-500 dark:text-gray-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-all"
-                        onClick={(e) => { e.stopPropagation(); onDelete(); }}
-                        title={t('common.delete')}
+                        className="flex items-center justify-center gap-0.5 px-1 py-1 rounded-lg text-xs font-semibold transition-all shadow-xs bg-gray-50 dark:bg-base-200 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-base-300 border border-gray-200 dark:border-base-300 active:scale-95"
+                        onClick={(e) => { e.stopPropagation(); setIsActionsModalOpen(true); }}
+                        title={t('accounts.actions_modal.title', '账号操作管理')}
                     >
-                        <Trash2 className="w-3.5 h-3.5" />
+                        <MoreHorizontal className="w-3 h-3 flex-shrink-0" />
+                        <span className="truncate">{t('accounts.action_more', '更多')}</span>
                     </button>
                 </div>
+
+                {/* Modals */}
+                <AccountActionsModal
+                    isOpen={isActionsModalOpen}
+                    onClose={() => setIsActionsModalOpen(false)}
+                    account={account}
+                    onSwitch={(target) => onSwitch(target)}
+                    onWarmup={onWarmup}
+                    onViewDevice={() => {
+                        setIsActionsModalOpen(false);
+                        onViewDevice();
+                    }}
+                    onViewDetails={() => {
+                        setIsActionsModalOpen(false);
+                        onViewDetails();
+                    }}
+                    onExport={onExport}
+                    onUpdateLabel={onUpdateLabel}
+                    onDelete={() => {
+                        setIsActionsModalOpen(false);
+                        onDelete();
+                    }}
+                    isSwitching={isSwitching}
+                    isRefreshing={isRefreshing}
+                />
             </td>
         </>
     );
@@ -762,6 +833,7 @@ function AccountTable({
     onToggleSelect,
     onToggleAll,
     currentAccountId,
+    activeClients,
     switchingAccountId,
     onSwitch,
     onRefresh,
@@ -774,7 +846,6 @@ function AccountTable({
     onWarmup,
     onUpdateLabel,
     onViewError,
-    quotaWindow,
 }: AccountTableProps) {
     const { t } = useTranslation();
 
@@ -808,8 +879,8 @@ function AccountTable({
 
         return [...accounts].sort((a, b) => {
             if (sortConfig.key === 'reset_time') {
-                const timeA = extractAccountResetTime(a, quotaWindow);
-                const timeB = extractAccountResetTime(b, quotaWindow);
+                const timeA = extractAccountResetTime(a);
+                const timeB = extractAccountResetTime(b);
 
                 // 没有 reset_time 的排到后面
                 if (timeA === null && timeB === null) return 0;
@@ -828,7 +899,7 @@ function AccountTable({
 
             return 0;
         });
-    }, [accounts, sortConfig, quotaWindow, isSortingActive]);
+    }, [accounts, sortConfig, isSortingActive]);
 
     // 配置拖拽传感器
     const sensors = useSensors(
@@ -842,6 +913,32 @@ function AccountTable({
 
     const accountIds = useMemo(() => sortedAccounts.map(a => a.id), [sortedAccounts]);
     const activeAccount = useMemo(() => sortedAccounts.find(a => a.id === activeId), [sortedAccounts, activeId]);
+
+    const [isCopyingSelected, setIsCopyingSelected] = useState(false);
+    const handleCopySelectedCredentials = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (selectedIds.size === 0 || isCopyingSelected) return;
+        try {
+            setIsCopyingSelected(true);
+            const response = await exportAccounts(Array.from(selectedIds));
+            if (response.accounts && response.accounts.length > 0) {
+                const content = JSON.stringify(response.accounts, null, 2);
+                const ok = await copyToClipboard(content);
+                if (ok) {
+                    showToast(t('accounts.selected_credentials_copied', {
+                        count: response.accounts.length,
+                        defaultValue: `已复制 ${response.accounts.length} 个账号凭据到剪贴板`,
+                    }), 'success');
+                }
+            } else {
+                showToast(t('accounts.no_credentials_found', '未获取到账号凭据'), 'warning');
+            }
+        } catch (err) {
+            showToast(`${t('common.error')}: ${err}`, 'error');
+        } finally {
+            setIsCopyingSelected(false);
+        }
+    };
 
     const handleDragStart = (event: DragStartEvent) => {
         if (isSortingActive) return;
@@ -895,7 +992,23 @@ function AccountTable({
                                     onChange={onToggleAll}
                                 />
                             </th>
-                            <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[300px] whitespace-nowrap">{t('accounts.table.email')}</th>
+                            <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider w-[300px] whitespace-nowrap">
+                                <div className="flex items-center gap-2">
+                                    <span>{t('accounts.table.email')}</span>
+                                    {selectedIds.size > 0 && (
+                                        <button
+                                            type="button"
+                                            onClick={handleCopySelectedCredentials}
+                                            disabled={isCopyingSelected}
+                                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium normal-case bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/50 border border-blue-200 dark:border-blue-800/60 shadow-xs transition-colors"
+                                            title={t('accounts.copy_selected_credentials_tooltip', '复制所有选中账号凭据 (JSON)')}
+                                        >
+                                            <BookCopy className="w-3 h-3" />
+                                            <span>{t('accounts.copy_selected_credentials', '复制所有凭据')} ({selectedIds.size})</span>
+                                        </button>
+                                    )}
+                                </div>
+                            </th>
                             <th className="px-2 py-1 text-left rtl:text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider min-w-[340px] whitespace-nowrap">
                                 <button
                                     type="button"
@@ -906,7 +1019,7 @@ function AccountTable({
                                     )}
                                     title={t('accounts.table.sort_by_reset_time', '点击按配额重置时间排序')}
                                 >
-                                    <span>{quotaWindow === 'weekly' ? t('accounts.table.weekly_quota', '周配额') : t('accounts.table.quota')}</span>
+                                    <span>{t('accounts.table.quota', '模型配额')}</span>
                                     {sortConfig.key === 'reset_time' ? (
                                         sortConfig.direction === 'asc' ? <ArrowUp className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" /> : <ArrowDown className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
                                     ) : (
@@ -932,7 +1045,7 @@ function AccountTable({
                                     )}
                                 </button>
                             </th>
-                            <th className="px-2 py-1 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider whitespace-nowrap sticky right-0 w-[220px] bg-gray-50 dark:bg-base-200 z-20 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center">{t('accounts.table.actions')}</th>
+                            <th className="px-1 py-1 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider whitespace-nowrap sticky right-0 w-[136px] min-w-[136px] max-w-[136px] bg-gray-50 dark:bg-base-200 z-20 shadow-[-12px_0_12px_-12px_rgba(0,0,0,0.1)] dark:shadow-[-12px_0_12px_-12px_rgba(255,255,255,0.05)] text-center">{t('accounts.table.actions')}</th>
                         </tr >
                     </thead >
                     <SortableContext items={accountIds} strategy={verticalListSortingStrategy}>
@@ -944,6 +1057,7 @@ function AccountTable({
                                     selected={selectedIds.has(account.id)}
                                     isRefreshing={refreshingIds.has(account.id)}
                                     isCurrent={account.id === currentAccountId}
+                                    activeClients={activeClients}
                                     isSwitching={account.id === switchingAccountId}
                                     isDragging={account.id === activeId}
                                     onSelect={() => onToggleSelect(account.id)}
@@ -957,7 +1071,6 @@ function AccountTable({
                                     onWarmup={onWarmup ? () => onWarmup(account.id) : undefined}
                                     onUpdateLabel={onUpdateLabel ? (label: string) => onUpdateLabel(account.id, label) : undefined}
                                     onViewError={() => onViewError(account.id)}
-                                    quotaWindow={quotaWindow}
                                     isDragDisabled={isSortingActive}
                                 />
                             ))}
@@ -989,6 +1102,7 @@ function AccountTable({
                                     <AccountRowContent
                                         account={activeAccount}
                                         isCurrent={activeAccount.id === currentAccountId}
+                                        activeClients={activeClients}
                                         isRefreshing={refreshingIds.has(activeAccount.id)}
                                         isSwitching={activeAccount.id === switchingAccountId}
                                         onSwitch={() => { }}
@@ -1000,7 +1114,6 @@ function AccountTable({
                                         onToggleProxy={() => { }}
                                         isDisabled={Boolean(activeAccount.disabled)}
                                         onViewError={() => { }}
-                                        quotaWindow={quotaWindow}
                                     />
                                 </tr>
                             </tbody>

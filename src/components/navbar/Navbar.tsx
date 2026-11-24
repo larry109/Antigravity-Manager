@@ -15,7 +15,7 @@ import type { NavItem } from './constants';
  */
 function Navbar() {
     const { t } = useTranslation();
-    const { config, saveConfig } = useConfigStore();
+    const { config, updateLanguage, updateTheme } = useConfigStore();
 
     // 创建导航项(包含翻译后的标签)
     const navItems: NavItem[] = [
@@ -47,11 +47,7 @@ function Navbar() {
 
             // @ts-ignore
             const transition = document.startViewTransition(async () => {
-                saveConfig({
-                    ...config,
-                    theme: newTheme,
-                    language: config.language
-                }, true);
+                await updateTheme(newTheme);
             });
 
             transition.ready.then(() => {
@@ -74,23 +70,15 @@ function Navbar() {
             });
         } else {
             // Fallback: direct switch (Linux or browsers without View Transition)
-            await saveConfig({
-                ...config,
-                theme: newTheme,
-                language: config.language
-            }, true);
+            await updateTheme(newTheme);
         }
     };
 
-    // 语言切换逻辑
-    const handleLanguageChange = async (langCode: string) => {
-        if (!config) return;
-
-        await saveConfig({
-            ...config,
-            language: langCode,
-            theme: config.theme
-        }, true);
+    // 语言切换逻辑 (即时乐观更新 + 串行尾随持久化)
+    const handleLanguageChange = (langCode: string) => {
+        updateLanguage(langCode).catch(err => {
+            console.error('Failed to update language:', err);
+        });
     };
 
     return (

@@ -9,6 +9,16 @@ pub struct AppConfig {
     pub theme: String,
     pub auto_refresh: bool,
     pub refresh_interval: i32, // minutes
+    /// 启动完成、账号加载就绪后，异步刷新一次全部账号配额
+    #[serde(default = "default_startup_refresh")]
+    pub startup_refresh: bool,
+    /// 批量配额刷新与启动探测时的同时探测账号数（滑动窗口容量），默认 5，范围 1~20
+    #[serde(default = "default_refresh_concurrency")]
+    pub refresh_concurrency: u32,
+    /// 全量配额刷新的滑动窗口延迟（秒）：账号完成后等待该时间再释放槽位给下一个账号。
+    /// 并发上限固定为 5；0 表示完成后立即让位。
+    #[serde(default = "default_refresh_slide_delay_secs")]
+    pub refresh_slide_delay_secs: f64,
     pub auto_sync: bool,
     pub sync_interval: i32, // minutes
     pub default_export_path: Option<String>,
@@ -20,6 +30,10 @@ pub struct AppConfig {
     pub antigravity_args: Option<Vec<String>>,      // [NEW] Antigravity startup arguments
     #[serde(default)]
     pub auto_launch: bool,     // Launch on startup
+    /// Login-item launches stay in the tray. Missing values stay on so existing
+    /// autostart entries, which already pass `--minimized`, keep that behavior.
+    #[serde(default = "default_quiet_autostart")]
+    pub quiet_autostart: bool,
     #[serde(default)]
     pub scheduled_warmup: ScheduledWarmupConfig, // [NEW] Scheduled warmup configuration
     #[serde(default)]
@@ -32,6 +46,40 @@ pub struct AppConfig {
     pub hidden_menu_items: Vec<String>, // Hidden menu item path list
     #[serde(default)]
     pub cloudflared: CloudflaredConfig, // [NEW] Cloudflared configuration
+    #[serde(default)]
+    pub lightweight_mode: bool, // [NEW] Lightweight mode: destroy webview on minimize/close to tray
+    #[serde(default)]
+    pub suggestion_delete_thinking_store: Option<bool>, // [NEW] 建议删除历史思考块缓存开关
+    #[serde(default)]
+    pub thinking_cleanup_dismissed: Option<bool>, // [NEW] 用户是否已确认/忽略该建议
+    #[serde(default)]
+    pub dismissed_thinking_cleanup_version: Option<String>, // [NEW] 用户已确认或忽略建议的目标版本号
+    #[serde(default)]
+    pub auto_switch_classic_depleted: bool, // [NEW] 兼容旧版开关
+    #[serde(default)]
+    pub classic_auto_switch: ClassicAutoSwitchConfig, // [NEW] 经典款配额自动热切换配置
+    #[serde(default = "default_tray_click_action")]
+    pub tray_click_action: String, // [NEW] 托盘左键点击行为: "mini" | "main"
+}
+
+fn default_tray_click_action() -> String {
+    "mini".to_string()
+}
+
+fn default_quiet_autostart() -> bool {
+    true
+}
+
+fn default_startup_refresh() -> bool {
+    true
+}
+
+fn default_refresh_concurrency() -> u32 {
+    5
+}
+
+fn default_refresh_slide_delay_secs() -> f64 {
+    0.2
 }
 
 /// Scheduled warmup configuration
@@ -47,9 +95,9 @@ pub struct ScheduledWarmupConfig {
 
 fn default_warmup_models() -> Vec<String> {
     vec![
-        "gemini-3-flash".to_string(),
+        "gemini-3.8-flash".to_string(),
         "claude".to_string(),
-        "gemini-3-pro-high".to_string(),
+        "gemini-3.1-pro-high".to_string(),
         "gemini-3.1-flash-image".to_string(),
     ]
 }
@@ -86,8 +134,8 @@ pub struct QuotaProtectionConfig {
 fn default_monitored_models() -> Vec<String> {
     vec![
         "claude".to_string(),
-        "gemini-3-pro-high".to_string(),
-        "gemini-3-flash".to_string(),
+        "gemini-3.1-pro-high".to_string(),
+        "gemini-3.8-flash".to_string(),
         "gemini-3.1-flash-image".to_string(),
     ]
 }
@@ -108,6 +156,43 @@ impl Default for QuotaProtectionConfig {
     }
 }
 
+/// Classic auto-switch configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassicAutoSwitchConfig {
+    /// Whether classic auto switch is enabled
+    pub enabled: bool,
+    /// Quota threshold percentage (0-99). Trigger switch when quota <= threshold
+    #[serde(default = "default_classic_auto_switch_threshold")]
+    pub threshold_percentage: u32,
+    /// List of monitored models
+    #[serde(default = "default_classic_monitored_models")]
+    pub monitored_models: Vec<String>,
+}
+
+fn default_classic_auto_switch_threshold() -> u32 {
+    0
+}
+
+fn default_classic_monitored_models() -> Vec<String> {
+    vec!["gemini".to_string(), "claude".to_string()]
+}
+
+impl ClassicAutoSwitchConfig {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            threshold_percentage: 0,
+            monitored_models: default_classic_monitored_models(),
+        }
+    }
+}
+
+impl Default for ClassicAutoSwitchConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Pinned quota models configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PinnedQuotaModelsConfig {
@@ -118,10 +203,10 @@ pub struct PinnedQuotaModelsConfig {
 
 fn default_pinned_models() -> Vec<String> {
     vec![
-        "gemini-3-pro-high".to_string(),
-        "gemini-3-flash".to_string(),
+        "gemini-3.1-pro-high".to_string(),
+        "gemini-3.8-flash".to_string(),
         "gemini-3.1-flash-image".to_string(),
-        "claude-sonnet-4-6-thinking".to_string(),
+        "claude-sonnet-4-6".to_string(),
     ]
 }
 
@@ -185,7 +270,10 @@ impl AppConfig {
             language: crate::modules::i18n::default_language(),
             theme: "system".to_string(),
             auto_refresh: true,
-            refresh_interval: 15,
+            refresh_interval: 10,
+            startup_refresh: true,
+            refresh_concurrency: 5,
+            refresh_slide_delay_secs: 0.2,
             auto_sync: false,
             sync_interval: 5,
             default_export_path: None,
@@ -195,12 +283,20 @@ impl AppConfig {
             antigravity_cli_executable: None,
             antigravity_args: None,
             auto_launch: false,
+            quiet_autostart: true,
             scheduled_warmup: ScheduledWarmupConfig::default(),
             quota_protection: QuotaProtectionConfig::default(),
             pinned_quota_models: PinnedQuotaModelsConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
             hidden_menu_items: Vec::new(),
             cloudflared: CloudflaredConfig::default(),
+            lightweight_mode: false,
+            suggestion_delete_thinking_store: None,
+            thinking_cleanup_dismissed: None,
+            dismissed_thinking_cleanup_version: None,
+            auto_switch_classic_depleted: false,
+            classic_auto_switch: ClassicAutoSwitchConfig::default(),
+            tray_click_action: default_tray_click_action(),
         }
     }
 }
@@ -224,5 +320,66 @@ mod tests {
             let restored: AppConfig = serde_json::from_str(&saved).unwrap();
             assert_eq!(restored.language, language);
         }
+    }
+
+    #[test]
+    fn quiet_autostart_defaults_to_true_when_missing() {
+        let mut config = AppConfig::new();
+        config.quiet_autostart = false;
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("quiet_autostart");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(restored.quiet_autostart);
+
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.quiet_autostart);
+    }
+
+    #[test]
+    fn startup_refresh_defaults_are_backward_compatible() {
+        let config = AppConfig::new();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("startup_refresh");
+        value.as_object_mut().unwrap().remove("refresh_concurrency");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert!(restored.startup_refresh);
+        assert_eq!(restored.refresh_concurrency, 5);
+
+        let mut config = AppConfig::new();
+        config.startup_refresh = false;
+        config.refresh_concurrency = 10;
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.startup_refresh);
+        assert_eq!(restored.refresh_concurrency, 10);
+    }
+
+    #[test]
+    fn refresh_slide_delay_defaults_to_0_2_seconds() {
+        let config = AppConfig::new();
+        assert!((config.refresh_slide_delay_secs - 0.2).abs() < f64::EPSILON);
+
+        let mut value = serde_json::to_value(&config).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("refresh_slide_delay_secs");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert!((restored.refresh_slide_delay_secs - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn tray_click_action_defaults_to_mini_when_missing() {
+        let mut config = AppConfig::new();
+        config.tray_click_action = "main".to_string();
+        let mut value = serde_json::to_value(&config).unwrap();
+        value.as_object_mut().unwrap().remove("tray_click_action");
+        let restored: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.tray_click_action, "mini");
+
+        let saved = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.tray_click_action, "main");
     }
 }

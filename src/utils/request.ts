@@ -8,17 +8,23 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_current_account': { url: '/api/accounts/current', method: 'GET' },
   'switch_account': { url: '/api/accounts/switch', method: 'POST' },
   'add_account': { url: '/api/accounts', method: 'POST' },
+  'batch_import_accounts': { url: '/api/accounts/batch-import', method: 'POST' },
   'delete_account': { url: '/api/accounts/:accountId', method: 'DELETE' },
+  'release_account_qos_jail': { url: '/api/accounts/:accountId/release-qos', method: 'POST' },
   'delete_accounts': { url: '/api/accounts/bulk-delete', method: 'POST' },
   'fetch_account_quota': { url: '/api/accounts/:accountId/quota', method: 'GET' },
   'refresh_account_quota': { url: '/api/accounts/:accountId/quota', method: 'GET' },
   'refresh_all_quotas': { url: '/api/accounts/refresh', method: 'POST' },
   'reorder_accounts': { url: '/api/accounts/reorder', method: 'POST' },
   'toggle_proxy_status': { url: '/api/accounts/:accountId/toggle-proxy', method: 'POST' },
+  'clear_account_forbidden': { url: '/api/accounts/:accountId/clear-forbidden', method: 'POST' },
   'warm_up_accounts': { url: '/api/accounts/warmup', method: 'POST' },
   'warm_up_all_accounts': { url: '/api/accounts/warmup', method: 'POST' },
   'warm_up_account': { url: '/api/accounts/:accountId/warmup', method: 'POST' },
   'update_account_label': { url: '/api/accounts/:accountId/label', method: 'POST' },
+  'update_account_priority': { url: '/api/accounts/:accountId/priority', method: 'POST' },
+  'update_account_project_id': { url: '/api/accounts/:accountId/project-id', method: 'POST' },
+  'auto_fetch_account_project_id': { url: '/api/accounts/:accountId/auto-fetch-project-id', method: 'POST' },
   'export_accounts': { url: '/api/accounts/export', method: 'POST' },
   'bind_device_profile': { url: '/api/accounts/:accountId/bind-device', method: 'POST' },
   'get_device_profiles': { url: '/api/accounts/:accountId/device-profiles', method: 'GET' },
@@ -42,12 +48,13 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'check_proxy_health': { url: '/api/proxy/health-check/trigger', method: 'POST' },
   'get_preferred_account': { url: '/api/proxy/preferred-account', method: 'GET' },
   'set_preferred_account': { url: '/api/proxy/preferred-account', method: 'POST' },
-  'fetch_zai_models': { url: '/api/zai/models/fetch', method: 'POST' },
   'load_config': { url: '/api/config', method: 'GET' },
   'get_config': { url: '/api/config', method: 'GET' },
   'save_config': { url: '/api/config', method: 'POST' },
   'get_proxy_stats': { url: '/api/proxy/stats', method: 'GET' },
   'set_proxy_monitor_enabled': { url: '/api/proxy/monitor/toggle', method: 'POST' },
+  'set_proxy_capture_health_logs': { url: '/api/proxy/monitor/health-logs/toggle', method: 'POST' },
+  'test_model_connectivity': { url: '/api/proxy/test-model', method: 'POST' },
 
   // Logs & Monitoring
   'get_proxy_logs_filtered': { url: '/api/logs', method: 'GET' },
@@ -55,6 +62,9 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_proxy_db_disk_size': { url: '/api/logs/disk-size', method: 'GET' },
   'clear_proxy_logs': { url: '/api/logs/clear', method: 'POST' },
   'clear_thinking_store': { url: '/api/proxy/thinking-store/clear', method: 'POST' },
+  'get_signature_cache_stats': { url: '/api/proxy/signature-cache/stats', method: 'GET' },
+  'clear_signature_cache': { url: '/api/proxy/signature-cache/clear', method: 'POST' },
+  'get_thinking_store_count': { url: '/api/proxy/thinking-store/count', method: 'GET' },
   'get_proxy_log_detail': { url: '/api/logs/:logId', method: 'GET' },
 
   // Debug Console
@@ -81,6 +91,20 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'get_opencode_config_content': { url: '/api/proxy/opencode/config', method: 'POST' },
   'get_canonical_families': { url: '/api/proxy/opencode/families', method: 'GET' },
 
+  // Hermes Agent provider and model configuration
+  'get_hermes_sync_status': { url: '/api/proxy/hermes/status', method: 'POST' },
+  'execute_hermes_sync': { url: '/api/proxy/hermes/sync', method: 'POST' },
+  'execute_hermes_restore': { url: '/api/proxy/hermes/restore', method: 'POST' },
+  'execute_hermes_clear': { url: '/api/proxy/hermes/clear', method: 'POST' },
+  'get_hermes_config_content': { url: '/api/proxy/hermes/config', method: 'POST' },
+
+  // OpenClaw provider and model configuration (supports v1.0 and v2.0)
+  'get_openclaw_sync_status': { url: '/api/proxy/openclaw/status', method: 'POST' },
+  'execute_openclaw_sync': { url: '/api/proxy/openclaw/sync', method: 'POST' },
+  'execute_openclaw_restore': { url: '/api/proxy/openclaw/restore', method: 'POST' },
+  'execute_openclaw_clear': { url: '/api/proxy/openclaw/clear', method: 'POST' },
+  'get_openclaw_config_content': { url: '/api/proxy/openclaw/config', method: 'POST' },
+
   // Stats
   'get_token_stats_hourly': { url: '/api/stats/token/hourly', method: 'GET' },
   'get_token_stats_daily': { url: '/api/stats/token/daily', method: 'GET' },
@@ -96,6 +120,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
 
   // System
   'get_data_dir_path': { url: '/api/system/data-dir', method: 'GET' },
+  'get_internal_error_log_path': { url: '/api/system/error-log-path', method: 'GET' },
+  'get_internal_error_log_disk_size': { url: '/api/system/error-log-size', method: 'GET' },
   'set_data_dir': { url: '/api/system/data-dir', method: 'POST' },
   'get_update_settings': { url: '/api/system/updates/settings', method: 'GET' },
   'save_update_settings': { url: '/api/system/updates/save', method: 'POST' },
@@ -116,6 +142,11 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'should_check_updates': { url: '/api/system/updates/check-status', method: 'GET' },
   'check_for_updates': { url: '/api/system/updates/check', method: 'POST' },
   'update_last_check_time': { url: '/api/system/updates/touch', method: 'POST' },
+  'check_hub_update': { url: '/api/system/hub/check-update', method: 'GET' },
+  'get_hub_fingerprint': { url: '/api/system/hub/fingerprint', method: 'GET' },
+  'detect_remote_hub_fingerprint': { url: '/api/system/hub/detect-fingerprint', method: 'POST' },
+  'get_effective_first_byte_timeouts': { url: '/api/system/timeouts/effective-first-byte', method: 'GET' },
+  'get_effective_timeout_config': { url: '/api/system/timeouts/effective-upload', method: 'GET' },
 
   // OAuth
   'prepare_oauth_url': { url: '/api/auth/url', method: 'GET' },
@@ -163,6 +194,8 @@ const COMMAND_MAPPING: Record<string, { url: string; method: 'GET' | 'POST' | 'D
   'renew_user_token': { url: '/api/user-tokens/:id/renew', method: 'POST' },
   'delete_user_token': { url: '/api/user-tokens/:id', method: 'DELETE' },
   'update_user_token': { url: '/api/user-tokens/:id', method: 'PATCH' },
+  'get_user_token_stats': { url: '/api/user-tokens/:id/stats', method: 'GET' },
+  'get_user_tokens_ranking': { url: '/api/user-tokens/ranking', method: 'GET' },
 
   // Proxy Pool (Web Mode Fix)
   'get_proxy_pool_config': { url: '/api/proxy/pool/config', method: 'GET' },
@@ -192,6 +225,7 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
   }
 
   let url = mapping.url;
+
   // [FIX] 创建 args 副本，用于移除已使用的路径参数
   let bodyArgs = args ? { ...args } : undefined;
 
@@ -209,7 +243,9 @@ export async function request<T>(cmd: string, args?: any): Promise<T> {
     });
   }
 
-  const apiKey = typeof window !== 'undefined' ? sessionStorage.getItem('abv_admin_api_key') : null;
+  const apiKey = typeof window !== 'undefined'
+    ? (sessionStorage.getItem('abv_admin_api_key') || localStorage.getItem('abv_admin_api_key'))
+    : null;
 
   const options: RequestInit = {
     method: mapping.method,
