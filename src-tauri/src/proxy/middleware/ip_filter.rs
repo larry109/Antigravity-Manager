@@ -364,7 +364,10 @@ mod tests {
         assert!(is_direct_loopback(&request_from_ip(mapped_loopback, None)));
         assert!(!is_direct_loopback(&request_from_ip(lan, None)));
         // 伪造转发头不能把公网连接伪装成本机
-        assert!(!is_direct_loopback(&request_from_ip(lan, Some("127.0.0.1"))));
+        assert!(!is_direct_loopback(&request_from_ip(
+            lan,
+            Some("127.0.0.1")
+        )));
 
         let missing = Request::builder().body(axum::body::Body::empty()).unwrap();
         assert!(!is_direct_loopback(&missing));

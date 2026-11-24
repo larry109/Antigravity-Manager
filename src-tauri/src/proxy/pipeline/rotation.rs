@@ -1248,4 +1248,65 @@ mod tests {
         assert_eq!(long_plan.next, TerminalNextStep::Rotate);
         assert!(long_plan.abandon_sticky_account);
     }
+
+    /// Fork regression guard (SECURITY-FORK.md #12): with a single account and a
+    /// persistent 429, the request must end. An in-place retry is not counted by
+    /// `next_rotation_attempt`, so any path that keeps returning `RetrySameAccount`
+    /// would make the client wait forever.
+    #[test]
+    fn single_account_persistent_429_always_terminates() {
+        use crate::proxy::pipeline::terminal::TerminalNextStep;
+        use crate::proxy::sticky_config::SchedulingMode;
+        let bodies = [
+            r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota).","status":"RESOURCE_EXHAUSTED"}}"#,
+            r#"{"error":{"code":429,"message":"You have exhausted your capacity on this model. Your quota will reset after 2s.","status":"RESOURCE_EXHAUSTED","details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"2s"}]}}"#,
+        ];
+        for body in bodies {
+            for (mode, cache_bound) in [
+                (SchedulingMode::CacheFirst, true),
+                (SchedulingMode::CacheFirst, false),
+                (SchedulingMode::Balance, true),
+                (SchedulingMode::PerformanceFirst, true),
+            ] {
+                let classification =
+                    crate::proxy::pipeline::UpstreamClassification::classify(429, body, None);
+                let max_attempts = calculate_max_retry_attempts(1);
+                let mut state = RequestRetryState::default();
+                let mut used_attempts = 0;
+                let mut retry_same_account = false;
+                let mut sends = 0usize;
+                while let Some(attempt) =
+                    next_rotation_attempt(&mut used_attempts, max_attempts, retry_same_account)
+                {
+                    sends += 1;
+                    assert!(
+                        sends <= 12,
+                        "retry loop did not terminate (mode {:?}, cache_bound {})",
+                        mode,
+                        cache_bound
+                    );
+                    let plan = state.plan_http_retry(
+                        "account-0",
+                        429,
+                        body,
+                        None,
+                        false,
+                        attempt,
+                        1,
+                        mode,
+                        cache_bound,
+                        60,
+                        scheduling_allows_grace(mode, 1),
+                        &classification,
+                    );
+                    if plan.next == TerminalNextStep::Stop
+                        || matches!(plan.strategy, RetryStrategy::NoRetry)
+                    {
+                        break;
+                    }
+                    retry_same_account = plan.next == TerminalNextStep::RetrySameAccount;
+                }
+            }
+        }
+    }
 }
