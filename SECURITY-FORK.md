@@ -1,5 +1,9 @@
 # Security hardening — divergence from upstream
 
+> **Rebased on upstream `v5.0.4` (2026-11-25).** Each fix below was re-checked against
+> the new code; the per-item status notes say what upstream fixed on its own, what was
+> re-applied, and what had to be adapted.
+
 This fork tracks [lbjlaq/Antigravity-Manager](https://github.com/lbjlaq/Antigravity-Manager)
 and carries a set of security fixes on top of it. This file exists so that a future
 `git merge upstream/main` is easy to reason about: it lists every place where this
@@ -43,6 +47,13 @@ only the TCP peer address counts. Put your reverse proxy there (`127.0.0.1`, `::
 for nginx/Caddy/cloudflared on the same host) to get real client IPs in the logs again.
 
 ### 3. OAuth callback validates the `state` parameter
+
+*v5.0.4 status: upstream now compares `state` **only when a login flow is pending**; with
+no pending flow it still exchanges any `code` it receives, which is the same login-CSRF
+sink. Re-applied as: no pending flow → refuse. Upstream also interpolated the
+attacker-controlled `error_description` query parameter raw into the HTML page
+(reflected XSS on the proxy origin); it is now escaped like the other error strings (#11).*
+
 `src-tauri/src/proxy/server.rs`, `src-tauri/src/modules/oauth_server.rs`
 
 `/auth/callback` is public by necessity and ignored the `state` parameter (the field
@@ -70,6 +81,10 @@ text** — had no IP filtering at all. It now gets the same layer, running befor
 matching prefix length through response timing. `constant_time_eq` compares every byte.
 
 ### 6. `/internal/*` is restricted to loopback
+
+*v5.0.4 status: fixed upstream (`ip_filter::is_direct_loopback`, checked before any auth
+mode, non-loopback → 403). Upstream's version is kept; it is stricter than ours.*
+
 `src-tauri/src/proxy/middleware/auth.rs`
 
 `/internal/warmup` bypassed authentication unconditionally, so on an exposed instance
@@ -127,6 +142,11 @@ Upstream error strings were interpolated raw into HTML. Now escaped via `html_es
 
 ## Known issues deliberately NOT changed
 
+- **macOS Keychain item for the JetBrains ACP plugin is still created with `-A`**
+  (`modules/integration.rs`, `antigravity-acp`, added upstream after 4.7.10). The reader is
+  the plugin's own `agy_acp_server`, not an Antigravity app, so the `-T` list used in #9
+  would not cover it and would break the plugin. Same partial-fix caveat as #9 applies.
+
 These were found during the audit and left alone on purpose — fixing them would cost
 functionality or needs a refactor rather than a patch.
 
@@ -150,6 +170,16 @@ functionality or needs a refactor rather than a patch.
   `rquest`, device-fingerprint falsification.** These are the purpose of the tool, not
   defects. They are also the most likely real-world risk to you: **Google account
   suspension**. Use throwaway accounts.
+
+## Prompt rewriting (upstream v5 default) — disable for API use
+
+Upstream v5 rewrites prompts by default: `prompt_rewrite.sideload_mode: auto` moves any
+system prompt longer than 300 characters into the first user turn wrapped in a
+`[SYSTEM MANDATE]` block, and `normalize_identity: true` replaces "You are …" identity
+sentences with the official Antigravity identity. That is meant for coding agents (Cursor,
+Cline, OpenCode); for an application that owns its prompt (a site persona, an assistant)
+it silently changes behaviour. Set `"sideload_mode": "off"` and
+`"normalize_identity": false` under `proxy.prompt_rewrite` (or `ABV_NORMALIZE_IDENTITY=off`).
 
 ## Recommended configuration
 
