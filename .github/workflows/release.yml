@@ -54,7 +54,13 @@ jobs:
           fi
 
           # 2. 识别是否为预发布标签 (包含 '-')
-          if [[ "$TAG_NAME" == *-* ]]; then
+          # Fork: `vX.Y.Z-sec.N` tags are this fork's security-hardened stable builds of
+          # upstream `vX.Y.Z`. They are cut from `main` and published as stable releases.
+          if [[ "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-sec\.[0-9]+$ ]]; then
+            IS_PRERELEASE="false"
+            RELEASE_TYPE="stable"
+            echo "📋 Release category: Fork security release ($TAG_NAME)"
+          elif [[ "$TAG_NAME" == *-* ]]; then
             IS_PRERELEASE="true"
             RELEASE_TYPE="prerelease"
             echo "📋 Release category: Pre-release ($TAG_NAME)"
